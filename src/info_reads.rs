@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): replaced axum test dependency with TcpListener and added allDexsClearinghouseState startup guard.
 //! Read-only startup snapshots and process-local REST budgeting. Never used to submit actions.
 use crate::{exchange::Network, metrics::Metrics};
 use anyhow::Context;
@@ -300,38 +301,67 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn http_429_retries_only_reads_with_cooldown_and_bounded_attempts() {
-        use axum::{
-            Json, Router,
-            http::{HeaderMap, StatusCode},
-            routing::post,
-        };
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
-        for statuses in [[429, 200, 200], [429, 429, 429], [500, 200, 200]] {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for statuses in [[429_u16, 200, 200], [429, 429, 429], [500, 200, 200]] {
             let calls = Arc::new(AtomicUsize::new(0));
             let count = calls.clone();
-            let router = Router::new().route(
-                "/",
-                post(move |Json(body): Json<Value>| {
-                    let index = count.fetch_add(1, Ordering::SeqCst);
-                    async move {
-                        assert_eq!(body, json!({"type":"allPerpMetas"}));
-                        let mut headers = HeaderMap::new();
-                        headers.insert("retry-after", "70".parse().unwrap());
-                        (
-                            StatusCode::from_u16(statuses[index]).unwrap(),
-                            headers,
-                            Json(json!([])),
-                        )
-                    }
-                }),
-            );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}/", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
-                axum::serve(listener, router).await.unwrap();
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut raw = Vec::new();
+                    let header_end = loop {
+                        let mut buf = [0_u8; 512];
+                        let n = socket.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        raw.extend_from_slice(&buf[..n]);
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let headers_text = String::from_utf8_lossy(&raw[..header_end]);
+                    let content_len = headers_text
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while raw.len() < header_end + content_len {
+                        let mut buf = [0_u8; 512];
+                        let n = socket.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        raw.extend_from_slice(&buf[..n]);
+                    }
+                    let body: Value =
+                        serde_json::from_slice(&raw[header_end..header_end + content_len]).unwrap();
+                    assert_eq!(body, json!({"type":"allPerpMetas"}));
+                    let index = count.fetch_add(1, Ordering::SeqCst);
+                    let status = statuses[index];
+                    let reason = match status {
+                        200 => "OK",
+                        429 => "Too Many Requests",
+                        500 => "Internal Server Error",
+                        _ => "Status",
+                    };
+                    let response_body = "[]";
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nRetry-After: 70\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                        response_body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                }
             });
             let before = Instant::now();
             let result = post_budgeted(

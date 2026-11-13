@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed keybinds, shell variables, and command-chaining entries from help catalogue.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandDoc {
     pub group: &'static str,
@@ -40,7 +41,7 @@ pub const COMMAND_GROUPS: &[CommandGroup] = &[
     CommandGroup {
         key: "shell",
         title: "shell",
-        summary: "variables, keybinds, help, and session controls",
+        summary: "help and session controls",
     },
 ];
 
@@ -139,7 +140,7 @@ pub const COMMAND_DOCS: &[CommandDoc] = &[
             "buy r0.5% sl 49000",
         ],
         notes: &[
-            "size tokens include base size, quote notional like 100$, percent like 5%, variables, and risk size like r100$",
+            "size tokens include base size, quote notional like 100$, percent like 5%, and risk size like r100$",
             "price levels accept absolutes, signed offsets like -100, signed percents like -0.5%, and $entry when an entry is known",
             "risk sizing requires a stop loss",
             "chase <distance> enables managed quote-following entry; distance can be quote, absolute, or percent",
@@ -321,24 +322,6 @@ pub const COMMAND_DOCS: &[CommandDoc] = &[
     },
     CommandDoc {
         group: "shell",
-        name: "variables",
-        summary: "set, print, and unset shell variables",
-        aliases: &["set", "print", "unset"],
-        examples: &["set @size 0.01", "print @size", "print", "unset @size"],
-        notes: &["variables expand before parser dispatch for normal commands"],
-        usage_tokens: &["set", "print", "unset"],
-    },
-    CommandDoc {
-        group: "shell",
-        name: "keybinds",
-        summary: "list and manage one-character shell key bindings",
-        aliases: &["keybinds", "binds", "bind", "unbind"],
-        examples: &["keybinds", "bind k buy 0.01", "unbind k"],
-        notes: &[],
-        usage_tokens: &["keybinds", "binds", "bind", "unbind"],
-    },
-    CommandDoc {
-        group: "shell",
         name: "session",
         summary: "clear shell output or quit the shell",
         aliases: &["clear", "cls", "quit", "exit", "q"],
@@ -381,7 +364,6 @@ fn overview_lines() -> Vec<String> {
     let mut lines = vec![
         "Hyperliquid operator commands".to_string(),
         "Use `help <category|command>` for details, or `help all` for every command.".to_string(),
-        "Chains: cmd1; sleep 2s; cmd2. Chains stop on failure.".to_string(),
         String::new(),
         "Categories:".to_string(),
     ];
@@ -394,7 +376,7 @@ fn overview_lines() -> Vec<String> {
         format!("  {:<8} {:<52} {}", group.key, names, group.summary)
     }));
     lines.push(String::new());
-    lines.push("Examples: help trade | help twap | help variables | help all".to_string());
+    lines.push("Examples: help trade | help twap | help chase | help all".to_string());
     lines
 }
 
@@ -419,11 +401,7 @@ fn group_lines(group: &CommandGroup) -> Vec<String> {
 }
 
 fn catalogue_lines(docs: Vec<&CommandDoc>) -> Vec<String> {
-    let mut lines = vec![
-        "Hyperliquid operator commands".to_string(),
-        "Chains: cmd1; sleep 2s; cmd2. Chains stop on failure.".to_string(),
-        String::new(),
-    ];
+    let mut lines = vec!["Hyperliquid operator commands".to_string(), String::new()];
     lines.extend(
         docs.into_iter()
             .flat_map(|doc| doc_lines(doc).into_iter().chain([String::new()])),

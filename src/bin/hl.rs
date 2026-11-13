@@ -1,7 +1,9 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed keybind/press commands, migrated RawMode to rustix::termios, enforced #![forbid(unsafe_code)], and added --json mode.
+#![forbid(unsafe_code)]
+
 use std::{
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -11,6 +13,9 @@ use hl_v2::{
     ipc::{self, IpcRequest, IpcResponse},
     runtime::{CommandExecutionState, CommandResponse},
     state::Fill,
+};
+use rustix::termios::{
+    LocalModes, OptionalActions, SpecialCodeIndex, Termios, tcgetattr, tcsetattr,
 };
 
 #[derive(Debug, Parser)]
@@ -111,8 +116,7 @@ async fn submit_shell_command(
     command: &str,
     session_id: Option<u64>,
 ) -> anyhow::Result<ClientControl> {
-    let command = resolve_shell_keybind(path, command).await?;
-    submit_and_print(path, &command, session_id).await
+    submit_and_print(path, command, session_id).await
 }
 
 async fn run_once(path: &Path, words: Vec<String>, session_id: Option<u64>) -> anyhow::Result<()> {
@@ -142,12 +146,6 @@ async fn run_once(path: &Path, words: Vec<String>, session_id: Option<u64>) -> a
                 ipc::request(path, &IpcRequest::CommandGet { command_id }, max_frame()).await?,
             )
         }
-        "press" => {
-            anyhow::ensure!(words.len() == 2, "press requires exactly one key");
-            let command = required_keybind(path, &words[1]).await?;
-            let _ = submit_and_print(path, &command, session_id).await?;
-            Ok(())
-        }
         "exec" => {
             anyhow::ensure!(words.len() > 1, "exec requires a command");
             let _ = submit_and_print(path, &words[1..].join(" "), session_id).await?;
@@ -158,30 +156,6 @@ async fn run_once(path: &Path, words: Vec<String>, session_id: Option<u64>) -> a
             Ok(())
         }
     }
-}
-
-async fn keybind(path: &Path, key: &str) -> anyhow::Result<Option<String>> {
-    match ipc::request(path, &IpcRequest::Keybinds, max_frame()).await? {
-        IpcResponse::Keybinds(payload) => Ok(payload.keybinds.get(key).cloned()),
-        IpcResponse::Error { message } => anyhow::bail!(message),
-        other => anyhow::bail!("unexpected keybind response: {other:?}"),
-    }
-}
-
-async fn resolve_shell_keybind(path: &Path, input: &str) -> anyhow::Result<String> {
-    Ok(keybind(path, input)
-        .await?
-        .unwrap_or_else(|| input.to_string()))
-}
-
-async fn required_keybind(path: &Path, key: &str) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        valid_key(key),
-        "press key must be one printable ASCII character"
-    );
-    keybind(path, key)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("key '{key}' is not bound"))
 }
 
 async fn submit_and_print(
@@ -264,10 +238,6 @@ fn print_health(response: IpcResponse) -> anyhow::Result<()> {
     print_response(response)?;
     anyhow::ensure!(healthy, "daemon is not healthy");
     Ok(())
-}
-
-fn valid_key(key: &str) -> bool {
-    key.len() == 1 && key.as_bytes()[0].is_ascii_graphic()
 }
 
 fn max_frame() -> usize {
@@ -673,33 +643,29 @@ fn redraw(out: &mut io::Stdout, prompt: &str, line: &str, cursor: usize) -> io::
 }
 
 struct RawMode {
-    saved: String,
+    saved: Termios,
 }
 
 impl RawMode {
     fn enable() -> anyhow::Result<Self> {
-        let saved = Command::new("stty")
-            .arg("-g")
-            .stdin(Stdio::inherit())
-            .output()?;
-        anyhow::ensure!(saved.status.success(), "failed to read terminal state");
-        let saved = String::from_utf8(saved.stdout)?.trim().to_string();
-        anyhow::ensure!(!saved.is_empty(), "terminal state is empty");
-        let status = Command::new("stty")
-            .args(["-icanon", "-echo", "-isig", "min", "0", "time", "5"])
-            .stdin(Stdio::inherit())
-            .status()?;
-        anyhow::ensure!(
-            status.success(),
-            "failed to enter noncanonical terminal mode for shell input"
-        );
+        let stdin = io::stdin();
+        let saved = tcgetattr(&stdin)
+            .map_err(|err| anyhow::anyhow!("failed to read terminal state: {err}"))?;
+        let mut raw = saved.clone();
+        raw.local_modes
+            .remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ISIG);
+        raw.special_codes[SpecialCodeIndex::VMIN] = 0;
+        raw.special_codes[SpecialCodeIndex::VTIME] = 5;
+        tcsetattr(&stdin, OptionalActions::Now, &raw).map_err(|err| {
+            anyhow::anyhow!("failed to enter noncanonical terminal mode for shell input: {err}")
+        })?;
         Ok(Self { saved })
     }
 
     fn drain_stdin() -> anyhow::Result<()> {
-        Self::set_timeout("0")?;
+        Self::set_timeout(0)?;
         let result = drain_stdin();
-        let restore = Self::set_timeout("5");
+        let restore = Self::set_timeout(5);
         match (result, restore) {
             (Err(err), _) => Err(err),
             (Ok(()), Err(err)) => Err(err),
@@ -707,12 +673,14 @@ impl RawMode {
         }
     }
 
-    fn set_timeout(value: &str) -> anyhow::Result<()> {
-        let status = Command::new("stty")
-            .args(["min", "0", "time", value])
-            .stdin(Stdio::inherit())
-            .status()?;
-        anyhow::ensure!(status.success(), "failed to update raw terminal timeout");
+    fn set_timeout(value: u8) -> anyhow::Result<()> {
+        let stdin = io::stdin();
+        let mut termios = tcgetattr(&stdin)
+            .map_err(|err| anyhow::anyhow!("failed to read terminal state: {err}"))?;
+        termios.special_codes[SpecialCodeIndex::VMIN] = 0;
+        termios.special_codes[SpecialCodeIndex::VTIME] = value;
+        tcsetattr(&stdin, OptionalActions::Now, &termios)
+            .map_err(|err| anyhow::anyhow!("failed to update raw terminal timeout: {err}"))?;
         Ok(())
     }
 }
@@ -732,9 +700,6 @@ fn drain_stdin() -> anyhow::Result<()> {
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        let _ = Command::new("stty")
-            .arg(&self.saved)
-            .stdin(Stdio::inherit())
-            .status();
+        let _ = tcsetattr(io::stdin(), OptionalActions::Now, &self.saved);
     }
 }

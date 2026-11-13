@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): updated CLI tests for removed keybinds/press (R-02) and added hl --json contract tests (R-04).
 mod support;
 
 use std::{
@@ -20,7 +21,6 @@ use hl_v2::{
     execution::{ExecutionStatus, SubmitReceipt},
     ipc::{self, IpcApp},
     metrics::Metrics,
-    operator::KeybindStore,
     runtime::{CommandQueue, CommandService},
     scope::ScopeRegistry,
 };
@@ -80,12 +80,8 @@ async fn real_client_enforces_arity_health_exit_and_typed_quit() {
     let state = Arc::new(RwLock::new(ready_perp("0")));
     let metrics = Metrics::default();
     let service = Arc::new(
-        CommandService::new(
-            state.clone(),
-            Arc::new(NoopExecutor),
-            KeybindStore::load(dir.join("keybinds.json")).unwrap(),
-        )
-        .with_scopes(ScopeRegistry::new("BTC".to_string()).unwrap()),
+        CommandService::new(state.clone(), Arc::new(NoopExecutor))
+            .with_scopes(ScopeRegistry::new("BTC".to_string()).unwrap()),
     );
     let app = IpcApp::new(state, metrics.clone(), CommandQueue::new(service).unwrap());
     let socket_for_server = socket.clone();
@@ -123,11 +119,11 @@ async fn real_client_enforces_arity_health_exit_and_typed_quit() {
     assert!(exec.status.success());
     assert!(String::from_utf8_lossy(&exec.stdout).contains("active=BTC"));
 
+    // R-02: keybinds and `hl press` are removed and fail closed.
     let bind = run_hl(&dir, &socket, &["bind", "k", "status"]);
-    assert!(bind.status.success());
-    let bound = run_hl(&dir, &socket, &["press", "k"]);
-    assert!(bound.status.success());
-    assert!(String::from_utf8_lossy(&bound.stdout).contains("active=BTC"));
+    assert!(!bind.status.success());
+    let press = run_hl(&dir, &socket, &["press", "k"]);
+    assert!(!press.status.success());
 
     let clear = run_hl(&dir, &socket, &["clear"]);
     assert!(clear.status.success());
@@ -137,11 +133,6 @@ async fn real_client_enforces_arity_health_exit_and_typed_quit() {
     assert!(!extra.status.success());
     assert!(String::from_utf8_lossy(&extra.stderr).contains("does not accept arguments"));
 
-    let unbound = run_hl(&dir, &socket, &["press", "u"]);
-    assert!(!unbound.status.success());
-    assert!(String::from_utf8_lossy(&unbound.stderr).contains("not bound"));
-    let press_extra = run_hl(&dir, &socket, &["press", "k", "extra"]);
-    assert!(!press_extra.status.success());
     let command_extra = run_hl(&dir, &socket, &["command", "get", "1", "extra"]);
     assert!(!command_extra.status.success());
     let unknown_command = run_hl(&dir, &socket, &["command", "get", "999999"]);
@@ -171,11 +162,7 @@ async fn interactive_shell_restores_the_exact_prior_terminal_state() {
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("backend.sock");
     let state = Arc::new(RwLock::new(ready_perp("0")));
-    let service = Arc::new(CommandService::new(
-        state.clone(),
-        Arc::new(NoopExecutor),
-        KeybindStore::load(dir.join("keybinds.json")).unwrap(),
-    ));
+    let service = Arc::new(CommandService::new(state.clone(), Arc::new(NoopExecutor)));
     let app = IpcApp::new(
         state,
         Metrics::default(),

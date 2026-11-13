@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): updated CommandService constructor and fixed-session retargeting check after removing keybinds and `;` chains.
 mod support;
 
 use hl_v2::{
@@ -6,7 +7,6 @@ use hl_v2::{
     execution::{ExecutionStatus, OrderStatus, SubmitReceipt},
     ipc::{self, IpcApp},
     metrics::Metrics,
-    operator::KeybindStore,
     runtime::{CommandQueue, CommandService},
     scope::ScopeRegistry,
 };
@@ -88,12 +88,8 @@ async fn identified_uds_submission_survives_lost_reply_and_preserves_typed_parti
     let state = Arc::new(RwLock::new(seeded));
     let executor = Arc::new(Executor::default());
     let service = Arc::new(
-        CommandService::new(
-            state.clone(),
-            executor.clone(),
-            KeybindStore::load(dir.join("binds")).unwrap(),
-        )
-        .with_scopes(ScopeRegistry::new("BTC".into()).unwrap()),
+        CommandService::new(state.clone(), executor.clone())
+            .with_scopes(ScopeRegistry::new("BTC".into()).unwrap()),
     );
     let queue = CommandQueue::new(service).unwrap();
     let app = IpcApp::new(state, Metrics::default(), queue.clone()).with_identity(
@@ -207,13 +203,13 @@ async fn identified_uds_submission_survives_lost_reply_and_preserves_typed_parti
     };
     assert!(matches!(rpc(&socket, stale).await, Response::Error { .. }));
     assert_eq!(executor.0.load(Ordering::SeqCst), 1);
-    // Fixed sessions cannot be retargeted by a command, including one in a chain.
+    // Fixed sessions cannot be retargeted by an instrument-switching command.
     let switch = Request::Submit {
         instance_id: instance.clone(),
         session_id: session,
         sequence: 2,
         market: "BTC".into(),
-        command: "instrument ETH; buy 0.01".into(),
+        command: "instrument ETH".into(),
     };
     let switched_id = match rpc(&socket, switch).await {
         Response::Submitted { command_id, .. } => command_id,
@@ -254,12 +250,8 @@ async fn retired_sequences_never_enqueue_again_and_unknown_daemon_ids_never_alia
     let dir = std::env::temp_dir().join(format!("hl-sequence-{}-{}", std::process::id(), now_ms()));
     let state = Arc::new(RwLock::new(ready_perp("0")));
     let service = Arc::new(
-        CommandService::new(
-            state.clone(),
-            Arc::new(Executor::default()),
-            KeybindStore::load(dir.join("bindings")).unwrap(),
-        )
-        .with_scopes(ScopeRegistry::new("BTC".into()).unwrap()),
+        CommandService::new(state.clone(), Arc::new(Executor::default()))
+            .with_scopes(ScopeRegistry::new("BTC".into()).unwrap()),
     );
     let queue = CommandQueue::new(service).unwrap();
     let session = queue
@@ -316,11 +308,7 @@ async fn retired_sequences_never_enqueue_again_and_unknown_daemon_ids_never_alia
         .await
         .unwrap();
     assert_eq!(replay.command_id, before.latest_command_id);
-    let other_service = Arc::new(CommandService::new(
-        state,
-        Arc::new(Executor::default()),
-        KeybindStore::load(dir.join("other-bindings")).unwrap(),
-    ));
+    let other_service = Arc::new(CommandService::new(state, Arc::new(Executor::default())));
     let other = CommandQueue::new(other_service).unwrap();
     assert_ne!(queue.instance_id(), other.instance_id());
     let _ = std::fs::remove_dir_all(dir);

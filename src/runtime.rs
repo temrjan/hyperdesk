@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed HTTP/keybind/variable/chain runtime handling, enforced queue bounds, and added HIP-3 health diagnostics.
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
@@ -18,7 +19,6 @@ use crate::{
     exchange::ActionConnectionHealth,
     execution::{ExecutionControl, ExecutionStatus, OrderStatus, SubmitReceipt},
     metrics::Metrics,
-    operator::{ChainStep, KeybindStore, Variables, parse_chain},
     protocol::{MarketKind, TimeInForce},
     scope::ScopeRegistry,
     state::{
@@ -86,18 +86,6 @@ impl CommandResponse {
             confirmation: None,
         }
     }
-
-    fn append(&mut self, other: Self) {
-        self.ok &= other.ok;
-        if other.clear {
-            self.clear = true;
-            self.lines.clear();
-        }
-        self.exit |= other.exit;
-        self.lines.extend(other.lines);
-        self.receipts.extend(other.receipts);
-        self.confirmation = other.confirmation;
-    }
 }
 
 pub type RefreshFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
@@ -112,8 +100,6 @@ struct RuntimeConfig {
     default_symbol: String,
     allowed_symbols: Vec<String>,
     symbol_aliases: BTreeMap<String, String>,
-    bind: String,
-    allow_remote: bool,
     vault: bool,
     required_account_mode: Option<String>,
     market_cross_bps: u32,
@@ -126,8 +112,6 @@ impl RuntimeConfig {
             default_symbol: cfg.default_symbol.clone(),
             allowed_symbols: cfg.allowed_symbols.iter().cloned().collect(),
             symbol_aliases: cfg.symbol_aliases.clone(),
-            bind: cfg.bind.to_string(),
-            allow_remote: cfg.allow_remote,
             vault: cfg.vault_address.is_some(),
             required_account_mode: cfg.required_account_mode.clone(),
             market_cross_bps: cfg.market_cross_bps,
@@ -147,8 +131,6 @@ impl RuntimeConfig {
                 }
             ),
             format!("symbol_aliases={}", self.aliases_line()),
-            format!("bind={}", self.bind),
-            format!("allow_remote={}", self.allow_remote),
             format!("vault={}", self.vault),
             format!(
                 "required_account_mode={}",
@@ -168,8 +150,6 @@ impl RuntimeConfig {
                 self.allowed_symbols.join(",")
             }),
             "symbol-aliases" | "symbol_aliases" | "aliases" => Some(self.aliases_line()),
-            "bind" => Some(self.bind.clone()),
-            "allow-remote" | "allow_remote" => Some(self.allow_remote.to_string()),
             "vault" | "vault-address" | "vault_address" => Some(self.vault.to_string()),
             "required-account-mode" | "required_account_mode" => Some(
                 self.required_account_mode
@@ -227,8 +207,6 @@ impl RuntimeConfig {
 pub struct CommandService {
     state: Arc<RwLock<TradingState>>,
     executor: Arc<dyn CommandExecutor>,
-    variables: Mutex<Variables>,
-    keybinds: Mutex<KeybindStore>,
     config: Option<RuntimeConfig>,
     refresher: Option<Arc<dyn StateRefresher>>,
     scopes: Option<Arc<ScopeRegistry>>,
@@ -269,16 +247,10 @@ pub struct MarketSessionResponse {
 }
 
 impl CommandService {
-    pub fn new(
-        state: Arc<RwLock<TradingState>>,
-        executor: Arc<dyn CommandExecutor>,
-        keybinds: KeybindStore,
-    ) -> Self {
+    pub fn new(state: Arc<RwLock<TradingState>>, executor: Arc<dyn CommandExecutor>) -> Self {
         Self {
             state,
             executor,
-            variables: Mutex::new(Variables::default()),
-            keybinds: Mutex::new(keybinds),
             config: None,
             refresher: None,
             scopes: None,
@@ -325,25 +297,7 @@ impl CommandService {
     }
 
     async fn execute_line_in(&self, session_id: Option<u64>, input: &str) -> CommandResponse {
-        let steps = match parse_chain(input) {
-            Ok(steps) => steps,
-            Err(err) => return CommandResponse::err(err.to_string()),
-        };
-        let mut out = CommandResponse::ok(Vec::new());
-        for step in steps {
-            let response = match step {
-                ChainStep::Sleep(delay) => {
-                    tokio::time::sleep(delay).await;
-                    CommandResponse::ok(Vec::new())
-                }
-                ChainStep::Command(command) => self.execute_one(session_id, &command).await,
-            };
-            let stop = !response.ok || response.exit;
-            out.append(response);
-            if stop || self.pending_confirmation(session_id).await.is_some() {
-                break;
-            }
-        }
+        let mut out = self.execute_one(session_id, input).await;
         if let Some(pending) = self.pending_confirmation(session_id).await {
             out.confirmation = Some(PendingConfirmationView {
                 scope: session_id
@@ -353,10 +307,6 @@ impl CommandService {
             });
         }
         out
-    }
-
-    pub async fn keybinds(&self) -> BTreeMap<String, String> {
-        self.keybinds.lock().await.binds().clone()
     }
 
     pub async fn open_market_session(
@@ -433,13 +383,9 @@ impl CommandService {
     }
 
     async fn execute_one(&self, session_id: Option<u64>, input: &str) -> CommandResponse {
-        let scopes = match session_id {
-            Some(_) => match self.scopes.as_deref() {
-                Some(scopes) => Some(scopes),
-                None => return CommandResponse::err("market sessions unavailable"),
-            },
-            None => None,
-        };
+        if session_id.is_some() && self.scopes.is_none() {
+            return CommandResponse::err("market sessions unavailable");
+        }
         if let Some(response) = self.confirmation_input(session_id, input).await {
             return response;
         }
@@ -449,10 +395,7 @@ impl CommandService {
                 pending.summary
             ));
         }
-        let command = match self.parse_runtime_command(session_id, input).await {
-            Ok(command) => command,
-            Err(message) => return CommandResponse::err(message),
-        };
+        let command = command::parse(input);
         match command {
             Command::Empty => CommandResponse::ok(Vec::new()),
             Command::Reject { message } => CommandResponse::err(message),
@@ -472,56 +415,6 @@ impl CommandService {
             Command::MarketList { filter } => self.markets(filter).await,
             Command::InstrumentShow => self.instrument(session_id).await,
             Command::InstrumentUse { symbol } => self.switch_instrument(session_id, symbol).await,
-            Command::SetVar { name, value } => {
-                let result = match session_id {
-                    Some(id) => {
-                        scopes
-                            .expect("scoped execution established registry")
-                            .set_variable(id, name.clone(), value)
-                            .await
-                    }
-                    None => self.variables.lock().await.set(name.clone(), value),
-                };
-                match result {
-                    Ok(()) => CommandResponse::ok(vec![format!("set {name}")]),
-                    Err(err) => CommandResponse::err(err),
-                }
-            }
-            Command::PrintVar { name } => self.print_var(session_id, name).await,
-            Command::UnsetVar { name } => {
-                let removed = match session_id {
-                    Some(id) => match scopes
-                        .expect("scoped execution established registry")
-                        .unset_variable(id, &name)
-                        .await
-                    {
-                        Ok(removed) => removed,
-                        Err(err) => return CommandResponse::err(err),
-                    },
-                    None => self.variables.lock().await.unset(&name),
-                };
-                CommandResponse::ok(vec![if removed {
-                    format!("unset {name}")
-                } else {
-                    format!("{name} not set")
-                }])
-            }
-            Command::Keybinds => self.render_keybinds().await,
-            Command::Bind { key, action } => {
-                let result = self.keybinds.lock().await.bind(key.clone(), action.clone());
-                match result {
-                    Ok(()) => CommandResponse::ok(vec![format!("bind {key} -> {action}")]),
-                    Err(err) => CommandResponse::err(err.to_string()),
-                }
-            }
-            Command::Unbind { key } => {
-                let result = self.keybinds.lock().await.unbind(&key);
-                match result {
-                    Ok(true) => CommandResponse::ok(vec![format!("unbind {key}")]),
-                    Ok(false) => CommandResponse::ok(vec![format!("{key} not bound")]),
-                    Err(err) => CommandResponse::err(err.to_string()),
-                }
-            }
             Command::Help { topic } => CommandResponse::ok(catalog::help_lines(topic.as_deref())),
             Command::Clear => CommandResponse::clear(),
             Command::Quit => CommandResponse::exit(),
@@ -684,53 +577,6 @@ impl CommandService {
                 expires_at_ms: pending.expires_at_ms,
             })
             .collect()
-    }
-
-    async fn parse_runtime_command(
-        &self,
-        session_id: Option<u64>,
-        input: &str,
-    ) -> Result<Command, String> {
-        let parsed = command::parse(input);
-        match parsed {
-            Command::SetVar { .. }
-            | Command::Bind { .. }
-            | Command::Unbind { .. }
-            | Command::PrintVar { .. }
-            | Command::UnsetVar { .. }
-            | Command::Reject { .. }
-            | Command::Unknown { .. }
-            | Command::Empty => Ok(parsed),
-            _ => {
-                let expanded = self.expand_line(session_id, input).await?;
-                Ok(command::parse(&expanded))
-            }
-        }
-    }
-
-    async fn expand_line(&self, session_id: Option<u64>, input: &str) -> Result<String, String> {
-        let tokens = command::tokenize(input)?;
-        let expanded = match session_id {
-            Some(id) => {
-                let scopes = self
-                    .scopes
-                    .as_ref()
-                    .ok_or_else(|| "market sessions unavailable".to_string())?;
-                let mut expanded = Vec::with_capacity(tokens.len());
-                for token in tokens {
-                    expanded.push(scopes.expand(id, &token).await?);
-                }
-                expanded
-            }
-            None => {
-                let vars = self.variables.lock().await;
-                tokens
-                    .into_iter()
-                    .map(|token| vars.expand_token(&token))
-                    .collect::<Result<Vec<_>, _>>()?
-            }
-        };
-        Ok(expanded.join(" "))
     }
 
     async fn selected_symbol(&self, session_id: Option<u64>) -> Result<String, String> {
@@ -1156,56 +1002,6 @@ impl CommandService {
             "account mode requirement={}",
             required.map(AccountMode::as_str).unwrap_or("any")
         )])
-    }
-
-    async fn print_var(&self, session_id: Option<u64>, name: Option<String>) -> CommandResponse {
-        if let Some(id) = session_id {
-            let Some(scopes) = &self.scopes else {
-                return CommandResponse::err("market sessions unavailable");
-            };
-            let values = match scopes.variables(id).await {
-                Ok(values) => values,
-                Err(err) => return CommandResponse::err(err),
-            };
-            return match name {
-                Some(name) => match values.iter().find(|(candidate, _)| candidate == &name) {
-                    Some((_, value)) => CommandResponse::ok(vec![format!("{name}={value}")]),
-                    None => CommandResponse::err(format!("unknown variable {name}")),
-                },
-                None => CommandResponse::ok(
-                    values
-                        .into_iter()
-                        .map(|(name, value)| format!("{name}={value}"))
-                        .collect::<Vec<_>>(),
-                ),
-            };
-        }
-        let vars = self.variables.lock().await;
-        match name {
-            Some(name) => match vars.get(&name) {
-                Some(value) => CommandResponse::ok(vec![format!("{name}={value}")]),
-                None => CommandResponse::err(format!("unknown variable {name}")),
-            },
-            None => CommandResponse::ok(
-                vars.iter()
-                    .map(|(name, value)| format!("{name}={value}"))
-                    .collect::<Vec<_>>(),
-            ),
-        }
-    }
-
-    async fn render_keybinds(&self) -> CommandResponse {
-        let keybinds = self.keybinds.lock().await;
-        let lines = keybinds
-            .binds()
-            .iter()
-            .map(|(key, action)| format!("{key} -> {action}"))
-            .collect::<Vec<_>>();
-        CommandResponse::ok(if lines.is_empty() {
-            vec!["no keybinds".to_string()]
-        } else {
-            lines
-        })
     }
 
     fn market_aliases(&self, symbol: &str) -> Vec<&str> {
@@ -1800,10 +1596,6 @@ impl CommandQueue {
 
     pub async fn get(&self, command_id: u64) -> Option<CommandExecutionRecord> {
         self.state.lock().await.jobs.get(&command_id).cloned()
-    }
-
-    pub async fn keybinds(&self) -> BTreeMap<String, String> {
-        self.service.keybinds().await
     }
 
     pub async fn open_market_session(

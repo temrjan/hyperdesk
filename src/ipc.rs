@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed keybind IPC, added scoped status and socket/peer-UID hardening.
 use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::Context;
@@ -37,7 +38,6 @@ pub enum IpcRequest {
     Balances,
     Markets,
     Metrics,
-    Keybinds,
     Fills { after_seq: u64 },
     FillsScoped { session_id: u64, after_seq: u64 },
     MarketSessionOpen { market: String },
@@ -60,7 +60,6 @@ pub enum IpcResponse {
     Balances(BalancesPayload),
     Markets(MarketsPayload),
     Metrics(MetricsPayload),
-    Keybinds(KeybindsPayload),
     Fills(FillsPayload),
     MarketSession(MarketSessionResponse),
     MarketSessionClosed,
@@ -128,12 +127,6 @@ pub struct MarketsPayload {
 #[serde(rename_all = "camelCase")]
 pub struct MetricsPayload {
     pub counters: CountersSnapshot,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct KeybindsPayload {
-    pub keybinds: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -348,9 +341,6 @@ impl IpcApp {
             }
             IpcRequest::Metrics => IpcResponse::Metrics(MetricsPayload {
                 counters: self.metrics.snapshot(),
-            }),
-            IpcRequest::Keybinds => IpcResponse::Keybinds(KeybindsPayload {
-                keybinds: self.queue.keybinds().await,
             }),
             IpcRequest::CommandSubmit { command } => {
                 IpcResponse::CommandSubmit(self.queue.submit(command).await)

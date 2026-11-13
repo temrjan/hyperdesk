@@ -1,3 +1,4 @@
+# Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed axum/tower, added rustix, and upgraded dependencies.
 [package]
 name = "hl-v2"
 version = "0.1.0"
@@ -23,13 +24,13 @@ alloy-signer-local = { version = "2.0.4", features = ["eip712"] }
 alloy-sol-types = { version = "1.5.6", features = ["eip712-serde", "json"] }
 anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
-axum = { version = "0.7", features = ["json"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 getrandom = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rmp-serde = "1"
 rust_decimal = { version = "1.39", features = ["serde", "serde-with-str"] }
+rustix = { version = "1.1", features = ["process", "termios"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
@@ -47,7 +48,6 @@ path = "src/bin/hl.rs"
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 libc = "0.2"
-tower = "0.5"
 
 [workspace]
 members = ["crates/hl-wire"]

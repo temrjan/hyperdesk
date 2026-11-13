@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): updated runtime tests for removed keybinds/@variables/chains (R-02) and added queue bound tests (R-09).
 mod support;
 
 use std::{
@@ -12,7 +13,6 @@ use hl_v2::{
     core::{CommandExecutor, ExecuteFuture},
     execution::{ExecutionControl, ExecutionStatus, SubmitReceipt},
     metrics::Metrics,
-    operator::KeybindStore,
     runtime::{CommandExecutionState, CommandQueue, CommandService, RefreshFuture, StateRefresher},
     scope::ScopeRegistry,
     state::{AccountMode, BalanceSummary},
@@ -68,7 +68,6 @@ fn service(executor: Arc<RecordingExecutor>) -> Arc<CommandService> {
     Arc::new(CommandService::new(
         Arc::new(RwLock::new(ready_perp("0"))),
         executor,
-        KeybindStore::load(temp_path("keybinds")).unwrap(),
     ))
 }
 
@@ -97,11 +96,7 @@ async fn impossible_account_mode_transition_never_stages_confirmation() {
     let now = now_ms();
     state.apply_account_mode(AccountMode::UnifiedAccount, now, Some(now));
     let state = Arc::new(RwLock::new(state));
-    let service = CommandService::new(
-        state.clone(),
-        executor.clone(),
-        KeybindStore::load(temp_path("account-mode-boundary-keybinds")).unwrap(),
-    );
+    let service = CommandService::new(state.clone(), executor.clone());
 
     let response = service.execute_line("account mode set standard").await;
     assert!(!response.ok);
@@ -122,12 +117,8 @@ async fn impossible_account_mode_transition_never_stages_confirmation() {
 async fn account_wide_confirmation_is_unique_across_market_sessions() {
     let executor = Arc::new(RecordingExecutor::default());
     let scopes = ScopeRegistry::new("BTC".to_string()).unwrap();
-    let service = CommandService::new(
-        Arc::new(RwLock::new(ready_perp("0"))),
-        executor,
-        KeybindStore::load(temp_path("confirmation-scope-keybinds")).unwrap(),
-    )
-    .with_scopes(scopes.clone());
+    let service = CommandService::new(Arc::new(RwLock::new(ready_perp("0"))), executor)
+        .with_scopes(scopes.clone());
     let first = scopes.open("BTC".to_string()).await;
     let second = scopes.open("BTC".to_string()).await;
 
@@ -153,33 +144,28 @@ async fn account_wide_confirmation_is_unique_across_market_sessions() {
 
 #[tokio::test]
 async fn quit_clear_and_chain_control_are_typed_not_text_conventions() {
+    // R-02: typed quit and clear remain active while `;` and `wait`/`sleep` chains fail closed.
     let service = service(Arc::new(RecordingExecutor::default()));
-    let quit = service.execute_line("status; q; status").await;
+    let quit = service.execute_line("q").await;
     assert!(quit.ok);
     assert!(quit.exit);
-    assert_eq!(
-        quit.lines.len(),
-        2,
-        "second status must not execute after quit"
-    );
 
-    let clear = service.execute_line("status; clear").await;
+    let clear = service.execute_line("clear").await;
     assert!(clear.ok);
     assert!(clear.clear);
     assert!(clear.lines.is_empty());
 
-    let wait = service.execute_line("wait 1ms; status").await;
-    assert!(wait.ok);
-    assert!(wait.lines.iter().any(|line| line.starts_with("active=BTC")));
+    let chain = service.execute_line("status; q").await;
+    assert!(!chain.ok);
+    let wait = service.execute_line("wait 1ms").await;
+    assert!(!wait.ok);
 }
 
 #[tokio::test]
 async fn every_read_policy_and_shell_family_executes_through_runtime() {
-    let keybind_path = temp_path("surface-keybinds");
     let service = CommandService::new(
         Arc::new(RwLock::new(ready_perp("0"))),
         Arc::new(RecordingExecutor::default()),
-        KeybindStore::load(&keybind_path).unwrap(),
     )
     .with_config(&Config::defaults(temp_path("surface-config")))
     .with_refresher(Arc::new(SuccessfulRefresher))
@@ -205,36 +191,48 @@ async fn every_read_policy_and_shell_family_executes_through_runtime() {
         "instrument BTC",
         "account mode",
         "account mode require any",
-        "set @size 0.01",
-        "print @size",
-        "print",
-        "unset @size",
-        "keybinds",
-        "bind k status",
-        "unbind k",
     ] {
         let response = service.execute_line(command).await;
         assert!(response.ok, "{command:?}: {response:?}");
     }
-    let _ = std::fs::remove_file(keybind_path);
+}
+
+struct DelayedExecutor {
+    delay: Duration,
+}
+
+impl CommandExecutor for DelayedExecutor {
+    fn execute_command<'a>(&'a self, _command: Command) -> ExecuteFuture<'a> {
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            accepted().await
+        })
+    }
+
+    fn execute_command_for<'a>(&'a self, _symbol: &'a str, _command: Command) -> ExecuteFuture<'a> {
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            accepted().await
+        })
+    }
 }
 
 #[tokio::test]
 async fn retained_scoped_job_finishes_after_session_close() {
-    let executor = Arc::new(RecordingExecutor::default());
+    let executor = Arc::new(DelayedExecutor {
+        delay: Duration::from_millis(50),
+    });
     let scopes = ScopeRegistry::new("BTC".to_string()).unwrap();
     let service = Arc::new(
-        CommandService::new(
-            Arc::new(RwLock::new(ready_perp("0"))),
-            executor,
-            KeybindStore::load(temp_path("scope-keybinds")).unwrap(),
-        )
-        .with_scopes(scopes.clone()),
+        CommandService::new(Arc::new(RwLock::new(ready_perp("0"))), executor)
+            .with_scopes(scopes.clone()),
     );
     let queue = CommandQueue::new(service).unwrap();
     let session = queue.open_market_session("BTC".to_string()).await.unwrap();
     let submitted = queue
-        .submit_scoped(session.session_id, "sleep 50ms; status".to_string())
+        .submit_scoped(session.session_id, "buy 0.01".to_string())
         .await
         .unwrap();
     queue
@@ -285,12 +283,8 @@ async fn account_summary_and_doctor_report_the_authoritative_source_and_causes()
     metrics.state_ws_disconnected();
     let execution = ExecutionControl::default();
     execution.halt("ambiguous action".to_string()).await;
-    let service = CommandService::new(
-        state,
-        Arc::new(RecordingExecutor::default()),
-        KeybindStore::load(temp_path("doctor-keybinds")).unwrap(),
-    )
-    .with_diagnostics(metrics, execution, None);
+    let service = CommandService::new(state, Arc::new(RecordingExecutor::default()))
+        .with_diagnostics(metrics, execution, None);
     let doctor = service.execute_line("doctor").await;
     assert!(!doctor.ok);
     assert!(

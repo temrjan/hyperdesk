@@ -1,3 +1,6 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed HTTP server and keybinds, enforced #![forbid(unsafe_code)], and hardened credentials/HIP-3/slippage wiring.
+#![forbid(unsafe_code)]
+
 use std::{
     io::{BufRead, BufReader, Write},
     path::PathBuf,
@@ -18,12 +21,10 @@ use hl_v2::{
     ipc::{self, IpcApp},
     managed::ManagedExecutor,
     metrics::Metrics,
-    operator::KeybindStore,
     protocol::Chain,
     runtime::{CommandQueue, CommandService, RefreshFuture, StateRefresher},
     scope::ScopeRegistry,
     security,
-    server::{self, AppState},
     state::{AccountMode, TradingState},
 };
 use tokio::sync::RwLock;
@@ -40,14 +41,8 @@ struct Args {
     mainnet: bool,
     #[arg(long, conflicts_with = "mainnet")]
     testnet: bool,
-    #[arg(long, env = "HL_V2_BIND")]
-    bind: Option<std::net::SocketAddr>,
-    #[arg(long, env = "HL_V2_ALLOW_REMOTE")]
-    allow_remote: bool,
     #[arg(long, env = "HL_V2_IPC_PATH")]
     ipc_path: Option<PathBuf>,
-    #[arg(long, env = "HL_V2_BACKEND_TOKEN")]
-    backend_token: Option<String>,
     #[arg(long, env = "HL_V2_WALLET_PROFILE")]
     wallet_profile: Option<String>,
     #[arg(long, env = "HL_V2_PASSWORD_FILE")]
@@ -145,19 +140,15 @@ async fn main() -> anyhow::Result<()> {
         metrics: metrics.clone(),
     });
     let service = Arc::new(
-        CommandService::new(
-            state.clone(),
-            executor,
-            KeybindStore::load(cfg.keybinds_path())?,
-        )
-        .with_config(&cfg)
-        .with_refresher(refresher)
-        .with_scopes(scopes.clone())
-        .with_diagnostics(
-            metrics.clone(),
-            session.execution.clone(),
-            session.action_connection.clone(),
-        ),
+        CommandService::new(state.clone(), executor)
+            .with_config(&cfg)
+            .with_refresher(refresher)
+            .with_scopes(scopes.clone())
+            .with_diagnostics(
+                metrics.clone(),
+                session.execution.clone(),
+                session.action_connection.clone(),
+            ),
     );
     tokio::spawn({
         let scopes = scopes.clone();
@@ -170,11 +161,9 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     let queue = CommandQueue::new(service)?;
-    let server_queue = queue.clone();
     let ipc_path = args
         .ipc_path
         .unwrap_or_else(|| cfg.runtime_dir().join("backend.sock"));
-    let http_listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     let ipc_listener = ipc::bind(&ipc_path).await?;
     let ipc_app = IpcApp::new(state.clone(), metrics.clone(), queue)
         .with_execution_control(session.execution.clone())
@@ -184,18 +173,8 @@ async fn main() -> anyhow::Result<()> {
             session.user.clone(),
             args.read_only,
         );
-    let http_app = server::router(
-        AppState::from_shared_state(state, metrics, &cfg)
-            .with_queue(server_queue)
-            .with_execution_control(session.execution)
-            .with_action_connection(session.action_connection),
-    );
-    println!("hld http {}", cfg.bind);
     println!("hld ipc {}", ipc_path.display());
-    tokio::select! {
-        result = ipc::serve_bound(ipc_listener, ipc_app, 8 * 1024 * 1024) => result,
-        result = axum::serve(http_listener, http_app) => result.map_err(Into::into),
-    }
+    ipc::serve_bound(ipc_listener, ipc_app, 8 * 1024 * 1024).await
 }
 
 fn apply_overrides(cfg: &mut Config, args: &Args) -> anyhow::Result<()> {
@@ -205,16 +184,7 @@ fn apply_overrides(cfg: &mut Config, args: &Args) -> anyhow::Result<()> {
     if args.testnet {
         cfg.network = Network::Testnet;
     }
-    if let Some(bind) = args.bind {
-        cfg.bind = bind;
-    }
-    if args.allow_remote {
-        cfg.allow_remote = true;
-    }
-    if let Some(token) = args.backend_token.as_ref() {
-        anyhow::ensure!(!token.trim().is_empty(), "backend token must not be empty");
-        cfg.backend_token = Some(token.clone());
-    }
+    cfg.validate()?;
     Ok(())
 }
 

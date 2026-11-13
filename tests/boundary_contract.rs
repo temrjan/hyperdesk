@@ -1,27 +1,20 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed HTTP server test and added R-01 strict config rejection checks.
 mod support;
 
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
-use axum::{
-    body::{Body, to_bytes},
-    http::{Request, StatusCode},
-};
 use hl_v2::{
     config::Config,
     exchange::Network,
-    metrics::Metrics,
     protocol::{
         Action, BatchOrder, Chain, Cloid, OrderGrouping, OrderRequest, OrderType, TimeInForce,
     },
     security::{Credentials, load_credentials, store_credentials},
-    server::{AppState, router},
-    state::{AccountMode, BalanceSummary},
 };
-use tower::ServiceExt;
 
-use support::{dec, now_ms, ready_perp};
+use support::{dec, now_ms};
 
 fn temp_dir(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("hl-v2-{label}-{}-{}", std::process::id(), now_ms()))
@@ -80,25 +73,28 @@ fn l1_hash_signature_and_envelope_remain_wire_stable() {
 
 #[test]
 fn config_is_strict_and_remote_bind_requires_both_opt_ins() {
+    // R-01: Config::load rejects removed HTTP keys (bind, allowRemote, backendToken) and unknown keys via deny_unknown_fields.
     let dir = temp_dir("config");
     fs::create_dir_all(&dir).unwrap();
+    for rejected_json in [
+        r#"{"network":"Mainnet","bind":"127.0.0.1:8088"}"#,
+        r#"{"network":"Mainnet","allowRemote":true}"#,
+        r#"{"network":"Mainnet","backendToken":"secret"}"#,
+        r#"{"network":"Mainnet","unknownField":123}"#,
+    ] {
+        fs::write(dir.join("hl-v2.json"), rejected_json).unwrap();
+        assert!(
+            Config::load(Some(dir.clone())).is_err(),
+            "expected Config::load to reject {rejected_json}"
+        );
+    }
+
     fs::write(
         dir.join("hl-v2.json"),
         r#"{
           "network":"Mainnet", "defaultSymbol":"btc", "allowedSymbols":["btc"],
-          "symbolAliases":{"x":"btc"}, "bind":"0.0.0.0:8080", "backendToken":"secret"
+          "symbolAliases":{"x":"btc"}
         }"#,
-    )
-    .unwrap();
-    assert!(Config::load(Some(dir.clone())).is_err());
-
-    let text = fs::read_to_string(dir.join("hl-v2.json")).unwrap();
-    fs::write(
-        dir.join("hl-v2.json"),
-        text.replace(
-            "\"backendToken\":\"secret\"",
-            "\"backendToken\":\"secret\", \"allowRemote\":true",
-        ),
     )
     .unwrap();
     let config = Config::load(Some(dir.clone())).unwrap();
@@ -151,56 +147,4 @@ fn credential_profile_round_trip_is_encrypted_and_permission_restricted() {
         );
     }
     fs::remove_dir_all(dir).unwrap();
-}
-
-#[tokio::test]
-async fn http_auth_and_portfolio_use_the_same_account_source_as_cli_sizing() {
-    let mut state = ready_perp("0");
-    let now = now_ms();
-    state.apply_account_mode(AccountMode::UnifiedAccount, now, Some(now));
-    state.apply_spot_balances(
-        Vec::new(),
-        BalanceSummary {
-            portfolio_margin_enabled: false,
-            portfolio_margin_ratio: None,
-            spot_value_usd: Some(dec("2222")),
-            spot_available_usd: Some(dec("2000")),
-            spot_unpriced_count: 0,
-            borrow_lend_health: None,
-            borrow_lend_health_factor: None,
-        },
-        now,
-        Some(now),
-    );
-    let mut config = Config::defaults(temp_dir("server"));
-    config.backend_token = Some("secret".to_string());
-    let app = router(AppState::new(state, Metrics::default(), &config));
-
-    let denied = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/portfolio")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/portfolio")
-                .header("x-hl-v2-token", "secret")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["account"]["source"], "spotClearinghouseState");
-    assert_eq!(json["account"]["valueUsd"], "2222");
 }

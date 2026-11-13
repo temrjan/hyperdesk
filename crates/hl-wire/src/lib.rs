@@ -1,5 +1,8 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): enforced #![forbid(unsafe_code)].
 //! Versioned trading IPC contracts shared by hld and independent native clients.
 //! No signing, exchange connectivity, or execution policy belongs in this crate.
+#![forbid(unsafe_code)]
+
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 

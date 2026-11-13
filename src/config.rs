@@ -1,7 +1,7 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed HTTP bind/auth/keybind config, enforced deny_unknown_fields, and added includeHip3 support.
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
@@ -17,9 +17,6 @@ pub struct Config {
     pub default_symbol: String,
     pub allowed_symbols: BTreeSet<String>,
     pub symbol_aliases: BTreeMap<String, String>,
-    pub bind: SocketAddr,
-    pub allow_remote: bool,
-    pub backend_token: Option<String>,
     pub vault_address: Option<String>,
     pub required_account_mode: Option<String>,
     pub market_cross_bps: u32,
@@ -48,9 +45,6 @@ impl Config {
             default_symbol: "BTC".to_string(),
             allowed_symbols: BTreeSet::new(),
             symbol_aliases: BTreeMap::new(),
-            bind: SocketAddr::from(([127, 0, 0, 1], 8088)),
-            allow_remote: false,
-            backend_token: None,
             vault_address: None,
             required_account_mode: None,
             market_cross_bps: 50,
@@ -69,10 +63,6 @@ impl Config {
         self.runtime_dir().join("managed_state_v2.json")
     }
 
-    pub fn keybinds_path(&self) -> PathBuf {
-        self.data_dir.join("keybinds.json")
-    }
-
     pub fn wallet_dir(&self) -> PathBuf {
         self.data_dir.join("wallets")
     }
@@ -87,15 +77,6 @@ impl Config {
         if let Some(value) = env_value("HL_V2_ALLOWED_SYMBOLS")? {
             self.allowed_symbols = parse_symbol_set(&value)?;
         }
-        if let Some(value) = env_value("HL_V2_BIND")? {
-            self.bind = value.parse()?;
-        }
-        if let Some(value) = env_value("HL_V2_ALLOW_REMOTE")? {
-            self.allow_remote = parse_bool("HL_V2_ALLOW_REMOTE", &value)?;
-        }
-        if let Some(value) = env_value("HL_V2_BACKEND_TOKEN")? {
-            self.backend_token = Some(non_empty("HL_V2_BACKEND_TOKEN", value)?);
-        }
         if let Some(value) = env_value("HL_V2_VAULT_ADDRESS")? {
             self.vault_address = Some(non_empty("HL_V2_VAULT_ADDRESS", value)?);
         }
@@ -108,15 +89,7 @@ impl Config {
         Ok(())
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.bind.ip().is_loopback() || self.allow_remote,
-            "remote bind requires HL_V2_ALLOW_REMOTE=true"
-        );
-        anyhow::ensure!(
-            self.bind.ip().is_loopback() || self.backend_token.is_some(),
-            "remote bind requires HL_V2_BACKEND_TOKEN"
-        );
+    pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.market_cross_bps <= 10_000,
             "market_cross_bps must be <= 10000"
@@ -139,15 +112,12 @@ impl Config {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FileConfig {
     network: Option<Network>,
     default_symbol: Option<String>,
     allowed_symbols: Option<BTreeSet<String>>,
     symbol_aliases: Option<BTreeMap<String, String>>,
-    bind: Option<SocketAddr>,
-    allow_remote: Option<bool>,
-    backend_token: Option<String>,
     vault_address: Option<String>,
     required_account_mode: Option<String>,
     market_cross_bps: Option<u32>,
@@ -169,15 +139,6 @@ impl FileConfig {
         }
         if let Some(value) = self.symbol_aliases {
             cfg.symbol_aliases = canonical_alias_map(value)?;
-        }
-        if let Some(value) = self.bind {
-            cfg.bind = value;
-        }
-        if let Some(value) = self.allow_remote {
-            cfg.allow_remote = value;
-        }
-        if let Some(value) = self.backend_token {
-            cfg.backend_token = Some(non_empty("backendToken", value)?);
         }
         if let Some(value) = self.vault_address {
             cfg.vault_address = Some(non_empty("vaultAddress", value)?);
@@ -216,6 +177,7 @@ fn parse_network(raw: &str) -> anyhow::Result<Network> {
     }
 }
 
+#[allow(dead_code)]
 fn parse_bool(name: &str, raw: &str) -> anyhow::Result<bool> {
     match raw.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),

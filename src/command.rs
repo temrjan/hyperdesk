@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed keybind, shell-variable, and command-chaining grammar.
 use serde::{Deserialize, Serialize};
 
 use crate::catalog;
@@ -147,24 +148,6 @@ pub enum Command {
     TwapCancel {
         id: Option<u64>,
     },
-    Keybinds,
-    Bind {
-        key: String,
-        action: String,
-    },
-    Unbind {
-        key: String,
-    },
-    SetVar {
-        name: String,
-        value: String,
-    },
-    PrintVar {
-        name: Option<String>,
-    },
-    UnsetVar {
-        name: String,
-    },
     Clear,
     Quit,
     Empty,
@@ -291,6 +274,7 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, String> {
     for ch in input.chars() {
         match ch {
             '"' => quote = !quote,
+            ';' if !quote => return Err("command chains (';') are unavailable".to_string()),
             ch if ch.is_whitespace() && !quote => {
                 if !cur.is_empty() {
                     out.push(std::mem::take(&mut cur));
@@ -318,6 +302,21 @@ fn parse_words(input: &str, words: &[String]) -> Command {
             topic: (words.len() > 1).then(|| words[1..].join(" ")),
         };
     }
+    match lower.first().map(String::as_str) {
+        Some("keybinds" | "binds" | "bind" | "unbind" | "press") => {
+            return reject("keybinds are unavailable");
+        }
+        Some("set" | "print" | "unset") => {
+            return reject("shell variables are unavailable");
+        }
+        Some("sleep" | "wait") => {
+            return reject("command chains and sleep/wait are unavailable");
+        }
+        _ => {}
+    }
+    if words.iter().any(|word| word.starts_with('@')) {
+        return reject("shell variables ('@name') are unavailable");
+    }
     match lower.as_slice() {
         [one] => match one.as_str() {
             "status" | "st" => return Command::Status,
@@ -344,7 +343,6 @@ fn parse_words(input: &str, words: &[String]) -> Command {
                     price: None,
                 };
             }
-            "keybinds" | "binds" => return Command::Keybinds,
             "quit" | "exit" | "q" => return Command::Quit,
             "clear" | "cls" => return Command::Clear,
             _ => {}
@@ -396,11 +394,6 @@ fn parse_words(input: &str, words: &[String]) -> Command {
         Some("account") => parse_account(words),
         Some("instrument" | "inst" | "instr" | "coin") => parse_instrument(words),
         Some("markets" | "market") => parse_market_list(words),
-        Some("set") => parse_set_var(words),
-        Some("print") => parse_print_var(words),
-        Some("unset") => parse_unset_var(words),
-        Some("bind") => parse_bind(words),
-        Some("unbind") => parse_unbind(words),
         _ => Command::Unknown {
             input: input.to_string(),
         },
@@ -560,6 +553,9 @@ fn parse_batch(words: &[String]) -> Command {
         let Some((size, price)) = split_once(&words[i], '@') else {
             return reject(format!("invalid batch leg '{}'", words[i]));
         };
+        if size.starts_with('@') || price.starts_with('@') {
+            return reject("shell variables ('@name') are unavailable");
+        }
         legs.push(BatchLeg { size, price });
         i += 1;
     }
@@ -983,60 +979,6 @@ fn parse_market_list(words: &[String]) -> Command {
         }
         _ => reject("markets expects optional filter"),
     }
-}
-
-fn parse_set_var(words: &[String]) -> Command {
-    if words.len() < 3 {
-        return reject("set requires @name and value");
-    }
-    if !words[1].starts_with('@') {
-        return reject("variable names must start with @");
-    }
-    Command::SetVar {
-        name: words[1].clone(),
-        value: words[2..].join(" "),
-    }
-}
-
-fn parse_print_var(words: &[String]) -> Command {
-    match words {
-        [_] => Command::PrintVar { name: None },
-        [_, name] if name.starts_with('@') => Command::PrintVar {
-            name: Some(name.clone()),
-        },
-        _ => reject("print accepts optional @name"),
-    }
-}
-
-fn parse_unset_var(words: &[String]) -> Command {
-    match words {
-        [_, name] if name.starts_with('@') => Command::UnsetVar { name: name.clone() },
-        _ => reject("unset requires @name"),
-    }
-}
-
-fn parse_bind(words: &[String]) -> Command {
-    if words.len() < 3 {
-        return reject("bind requires key and action");
-    }
-    if !valid_key(&words[1]) {
-        return reject("bind key must be one printable ASCII character");
-    }
-    Command::Bind {
-        key: words[1].clone(),
-        action: words[2..].join(" "),
-    }
-}
-
-fn parse_unbind(words: &[String]) -> Command {
-    match words {
-        [_, key] if valid_key(key) => Command::Unbind { key: key.clone() },
-        _ => reject("unbind requires one printable ASCII character"),
-    }
-}
-
-fn valid_key(key: &str) -> bool {
-    key.len() == 1 && key.as_bytes()[0].is_ascii_graphic()
 }
 
 #[derive(Default)]

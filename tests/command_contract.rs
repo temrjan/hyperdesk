@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): updated command grammar contract for removed keybinds, @variables, and `;` chains (R-02).
 use hl_v2::{
     catalog::COMMAND_DOCS,
     command::{self, Command, ProtectionKind, Side, Tif},
@@ -43,12 +44,6 @@ fn variant(command: &Command) -> &'static str {
         Command::BatchPlace(_) => "batch_place",
         Command::TwapPlace(_) => "twap_place",
         Command::TwapCancel { .. } => "twap_cancel",
-        Command::Keybinds => "keybinds",
-        Command::Bind { .. } => "bind",
-        Command::Unbind { .. } => "unbind",
-        Command::SetVar { .. } => "set_var",
-        Command::PrintVar { .. } => "print_var",
-        Command::UnsetVar { .. } => "unset_var",
         Command::Clear => "clear",
         Command::Quit => "quit",
         Command::Empty => "empty",
@@ -90,8 +85,6 @@ fn family(command: &Command) -> &'static str {
         Command::RiskShow | Command::ConfigShow | Command::ConfigGet { .. } | Command::Doctor => {
             "risk/config"
         }
-        Command::SetVar { .. } | Command::PrintVar { .. } | Command::UnsetVar { .. } => "variables",
-        Command::Keybinds | Command::Bind { .. } | Command::Unbind { .. } => "keybinds",
         Command::Clear | Command::Quit => "session",
         Command::Empty => "empty",
         Command::Reject { .. } => "reject",
@@ -154,12 +147,6 @@ fn every_typed_command_variant_has_representative_grammar() {
         ("batch buy 1@2", "batch_place"),
         ("twap buy 1 over 5", "twap_place"),
         ("twap cancel all", "twap_cancel"),
-        ("keybinds", "keybinds"),
-        ("bind k status", "bind"),
-        ("unbind k", "unbind"),
-        ("set @x 1", "set_var"),
-        ("print", "print_var"),
-        ("unset @x", "unset_var"),
         ("clear", "clear"),
         ("quit", "quit"),
         ("", "empty"),
@@ -172,7 +159,7 @@ fn every_typed_command_variant_has_representative_grammar() {
         assert_eq!(variant(&parsed), expected, "{input:?} -> {parsed:?}");
         assert!(seen.insert(expected), "duplicate variant case: {expected}");
     }
-    assert_eq!(seen.len(), 49, "typed command inventory changed");
+    assert_eq!(seen.len(), 43, "typed command inventory changed");
 }
 
 #[test]
@@ -230,13 +217,6 @@ fn every_documented_alias_maps_to_its_typed_family() {
         ("doctor", "risk/config"),
         ("preflight", "risk/config"),
         ("setup check", "risk/config"),
-        ("set @x 1", "variables"),
-        ("print", "variables"),
-        ("unset @x", "variables"),
-        ("keybinds", "keybinds"),
-        ("binds", "keybinds"),
-        ("bind k status", "keybinds"),
-        ("unbind k", "keybinds"),
         ("clear", "session"),
         ("cls", "session"),
         ("quit", "session"),
@@ -289,11 +269,6 @@ fn aliases_and_all_command_families_map_to_typed_intent() {
         ("twap buy 1 over 5", "twap"),
         ("lev iso 3", "leverage"),
         ("margin rm 1", "margin"),
-        ("set @x 1", "set"),
-        ("print @x", "print"),
-        ("unset @x", "unset"),
-        ("bind k buy 1", "bind"),
-        ("unbind k", "unbind"),
         ("cls", "clear"),
         ("q", "quit"),
     ];
@@ -329,6 +304,7 @@ fn aliases_and_all_command_families_map_to_typed_intent() {
 
 #[test]
 fn ambiguous_or_removed_grammar_fails_closed() {
+    // R-02: removed keybinds, @variables, and `;` / sleep / wait command chains fail closed.
     for input in [
         "buy 1 reduce reduce",
         "buy 1 post post",
@@ -340,8 +316,24 @@ fn ambiguous_or_removed_grammar_fails_closed() {
         "batch buy 1@2 trail 1",
         "cancel cloid 0x1,,0x2",
         "leverage cross 0",
+        "keybinds",
+        "binds",
+        "bind k status",
         "bind ü status",
+        "unbind k",
         "unbind ü",
+        "press k",
+        "set @x 1",
+        "print",
+        "print @x",
+        "unset @x",
+        "buy @size",
+        "buy 0.01 at @px",
+        "batch buy @sz@40000",
+        "batch buy 0.01@@px",
+        "status; orders",
+        "sleep 1s",
+        "wait 100ms",
         "requests reserve 1",
         "rate-limit reserve 1",
     ] {

@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed shell variable state from scoped sessions.
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -9,14 +10,11 @@ use std::{
 
 use tokio::sync::{Mutex, watch};
 
-use crate::operator::Variables;
-
 const SESSION_IDLE_MS: u64 = 120_000;
 
 #[derive(Debug)]
 struct Session {
     symbol: String,
-    variables: Variables,
     last_seen_ms: u64,
     jobs: u32,
     closed: bool,
@@ -70,7 +68,6 @@ impl ScopeRegistry {
             id,
             Session {
                 symbol,
-                variables: Variables::default(),
                 last_seen_ms: now_ms(),
                 jobs: 0,
                 closed: false,
@@ -167,38 +164,6 @@ impl ScopeRegistry {
             state.sessions.remove(&id);
             self.publish(&state);
         }
-    }
-
-    pub async fn expand(&self, id: u64, token: &str) -> Result<String, String> {
-        let mut state = self.state.lock().await;
-        let session = session_mut(&mut state, id)?;
-        session.last_seen_ms = now_ms();
-        session.variables.expand_token(token)
-    }
-
-    pub async fn set_variable(&self, id: u64, name: String, value: String) -> Result<(), String> {
-        let mut state = self.state.lock().await;
-        let session = session_mut(&mut state, id)?;
-        session.last_seen_ms = now_ms();
-        session.variables.set(name, value)
-    }
-
-    pub async fn unset_variable(&self, id: u64, name: &str) -> Result<bool, String> {
-        let mut state = self.state.lock().await;
-        let session = session_mut(&mut state, id)?;
-        session.last_seen_ms = now_ms();
-        Ok(session.variables.unset(name))
-    }
-
-    pub async fn variables(&self, id: u64) -> Result<Vec<(String, String)>, String> {
-        let mut state = self.state.lock().await;
-        let session = session_mut(&mut state, id)?;
-        session.last_seen_ms = now_ms();
-        Ok(session
-            .variables
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect())
     }
 
     pub async fn set_default(&self, symbol: String) {
