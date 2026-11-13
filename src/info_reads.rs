@@ -137,17 +137,49 @@ async fn post_budgeted(
     unreachable!("last attempt returns its response")
 }
 
+pub(crate) struct StartupWsSnapshots {
+    pub orders_by_dex: BTreeMap<String, Value>,
+    pub all_dexs_clearinghouse: Option<Value>,
+}
+
 struct OrderSnapshots {
     user: String,
     pending: BTreeSet<String>,
     values: BTreeMap<String, Value>,
+    need_all_dexs_clearinghouse: bool,
+    all_dexs_clearinghouse: Option<Value>,
 }
 impl OrderSnapshots {
+    fn complete(&self) -> bool {
+        self.pending.is_empty()
+            && (!self.need_all_dexs_clearinghouse || self.all_dexs_clearinghouse.is_some())
+    }
+
     fn accept(&mut self, message: Value) -> anyhow::Result<()> {
         match message.get("channel").and_then(Value::as_str) {
             Some("subscriptionResponse") | Some("pong") => return Ok(()),
             Some("error") => {
                 anyhow::bail!("openOrders initialization: exchange subscription error")
+            }
+            Some("allDexsClearinghouseState")
+                if self.need_all_dexs_clearinghouse || self.all_dexs_clearinghouse.is_some() =>
+            {
+                let data = message
+                    .get("data")
+                    .context("allDexsClearinghouseState snapshot missing data")?;
+                anyhow::ensure!(
+                    data.get("user")
+                        .and_then(Value::as_str)
+                        .is_some_and(|user| user.eq_ignore_ascii_case(&self.user)),
+                    "allDexsClearinghouseState snapshot user mismatch"
+                );
+                anyhow::ensure!(
+                    data.get("clearinghouseStates").is_some_and(Value::is_array),
+                    "allDexsClearinghouseState snapshot missing clearinghouseStates"
+                );
+                self.all_dexs_clearinghouse = Some(data.clone());
+                self.need_all_dexs_clearinghouse = false;
+                return Ok(());
             }
             Some("openOrders") => {}
             _ => anyhow::bail!("openOrders initialization: unexpected channel"),
@@ -179,6 +211,7 @@ impl OrderSnapshots {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn order_snapshots(
     network: Network,
     user: &str,
@@ -192,11 +225,26 @@ async fn order_snapshots_at(
     user: &str,
     dexes: BTreeSet<String>,
 ) -> anyhow::Result<BTreeMap<String, Value>> {
-    if dexes.is_empty() {
-        return Ok(BTreeMap::new());
+    Ok(startup_ws_snapshots_at(url, user, dexes, false)
+        .await?
+        .orders_by_dex)
+}
+
+pub(crate) async fn startup_ws_snapshots_at(
+    url: &str,
+    user: &str,
+    dexes: BTreeSet<String>,
+    include_all_dexs_clearinghouse: bool,
+) -> anyhow::Result<StartupWsSnapshots> {
+    if dexes.is_empty() && !include_all_dexs_clearinghouse {
+        return Ok(StartupWsSnapshots {
+            orders_by_dex: BTreeMap::new(),
+            all_dexs_clearinghouse: None,
+        });
     }
+    let total_subs = dexes.len() + usize::from(include_all_dexs_clearinghouse);
     anyhow::ensure!(
-        dexes.len() <= 1000,
+        total_subs <= 1000,
         "openOrders initialization exceeds WebSocket subscription limit"
     );
     time::timeout(Duration::from_secs(30), async {
@@ -204,8 +252,17 @@ async fn order_snapshots_at(
         for dex in &dexes {
             socket.send(Message::Text(json!({"method":"subscribe","subscription":{"type":"openOrders","user":user,"dex":dex}}).to_string().into())).await?;
         }
-        let mut snapshots = OrderSnapshots { user: user.to_owned(), pending: dexes, values: BTreeMap::new() };
-        while !snapshots.pending.is_empty() {
+        if include_all_dexs_clearinghouse {
+            socket.send(Message::Text(json!({"method":"subscribe","subscription":{"type":"allDexsClearinghouseState","user":user}}).to_string().into())).await?;
+        }
+        let mut snapshots = OrderSnapshots {
+            user: user.to_owned(),
+            pending: dexes,
+            values: BTreeMap::new(),
+            need_all_dexs_clearinghouse: include_all_dexs_clearinghouse,
+            all_dexs_clearinghouse: None,
+        };
+        while !snapshots.complete() {
             match socket.next().await.context("openOrders snapshot connection ended")?? {
                 Message::Text(text) => snapshots.accept(serde_json::from_str(text.as_ref())?)?,
                 Message::Ping(bytes) => socket.send(Message::Pong(bytes)).await?,
@@ -215,7 +272,10 @@ async fn order_snapshots_at(
             }
         }
         socket.close(None).await?;
-        Ok::<_, anyhow::Error>(snapshots.values)
+        Ok::<_, anyhow::Error>(StartupWsSnapshots {
+            orders_by_dex: snapshots.values,
+            all_dexs_clearinghouse: snapshots.all_dexs_clearinghouse,
+        })
     }).await.map_err(|_| anyhow::anyhow!("openOrders initialization timed out; complete DEX snapshots required"))?
 }
 
@@ -241,6 +301,8 @@ mod tests {
             user: "0xabc".into(),
             pending: BTreeSet::from(["".into(), "xyz".into()]),
             values: BTreeMap::new(),
+            need_all_dexs_clearinghouse: false,
+            all_dexs_clearinghouse: None,
         };
         let message = |user, dex, orders| json!({"channel":"openOrders","data":{"user":user,"dex":dex,"orders":orders}});
         assert!(s.accept(message("0xwrong", "", json!([]))).is_err());

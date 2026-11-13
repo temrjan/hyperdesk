@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): added includeHip3 state flag and persistent untracked HIP-3 exposure health warning.
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use rust_decimal::Decimal;
@@ -371,6 +372,10 @@ pub struct TradingState {
     pub recovered_trailing_placements: BTreeMap<String, Option<u64>>,
     #[serde(default)]
     pub recovered_order_outcomes: BTreeMap<String, RecoveredOrderOutcome>,
+    #[serde(default = "default_include_hip3")]
+    pub include_hip3: bool,
+    #[serde(default)]
+    pub untracked_hip3_warning: Option<String>,
     pub fill_session_start_ms: u64,
     position_floor_ms: BTreeMap<String, u64>,
     #[serde(skip)]
@@ -378,6 +383,10 @@ pub struct TradingState {
     order_floor_ms: BTreeMap<String, u64>,
     fill_seq: u64,
     fill_seen: HashSet<u64>,
+}
+
+fn default_include_hip3() -> bool {
+    true
 }
 
 impl TradingState {
@@ -403,12 +412,27 @@ impl TradingState {
             recent_fills: VecDeque::new(),
             recovered_trailing_placements: BTreeMap::new(),
             recovered_order_outcomes: BTreeMap::new(),
+            include_hip3: true,
+            untracked_hip3_warning: None,
             fill_session_start_ms: 0,
             position_floor_ms: BTreeMap::new(),
             position_revisions: BTreeMap::new(),
             order_floor_ms: BTreeMap::new(),
             fill_seq: 0,
             fill_seen: HashSet::new(),
+        }
+    }
+
+    pub fn record_untracked_hip3_warning(&mut self, dex: &str) -> Option<String> {
+        let dex = dex.trim();
+        let message = format!(
+            "untracked HIP-3 activity on dex {dex} while includeHip3=false; restart without --no-hip3"
+        );
+        if self.untracked_hip3_warning.is_none() {
+            self.untracked_hip3_warning = Some(message.clone());
+            Some(message)
+        } else {
+            None
         }
     }
 

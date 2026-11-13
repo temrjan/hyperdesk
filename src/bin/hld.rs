@@ -12,7 +12,7 @@ use alloy_signer_local::PrivateKeySigner;
 use clap::Parser;
 use hl_v2::{
     config::Config,
-    core::{CommandExecutor, Core, ExecuteFuture, ExecutionRecovery, PlanExecutor},
+    core::{CommandExecutor, Core, ExecutionRecovery, PlanExecutor},
     exchange::{ActionConnectionHealth, Network, WsActionClient},
     execution::{ActionJournal, ExecutionControl},
     feed::spawn_state_feed,
@@ -21,7 +21,7 @@ use hl_v2::{
     managed::ManagedExecutor,
     metrics::Metrics,
     protocol::Chain,
-    runtime::{CommandQueue, CommandService, RefreshFuture, StateRefresher},
+    runtime::{CommandQueue, CommandService, ReadOnlyExecutor, RefreshFuture, StateRefresher},
     scope::ScopeRegistry,
     security,
     state::{AccountMode, TradingState},
@@ -48,6 +48,8 @@ struct Args {
     password_file: Option<PathBuf>,
     #[arg(long)]
     read_only: bool,
+    #[arg(long)]
+    no_hip3: bool,
     #[arg(long, env = "HL_V2_USER")]
     user: Option<String>,
 }
@@ -89,10 +91,11 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(RwLock::new(TradingState::new(cfg.default_symbol.clone())));
     let session = session(&cfg, &args, state.clone(), metrics.clone()).await?;
     let mut seeded = InfoClient::with_metrics(cfg.network, metrics.clone())
-        .seed_state(
+        .seed_state_with_options(
             &cfg.default_symbol,
             &cfg.allowed_symbols,
             session.user.as_deref(),
+            cfg.include_hip3,
         )
         .await?;
     seeded.set_required_account_mode(required_account_mode(&cfg)?);
@@ -108,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
             ManagedExecutor::spawn_persisted_with_scopes(
                 state.clone(),
                 inner,
+                cfg.market_cross_bps,
                 std::time::Duration::from_millis(250),
                 cfg.managed_state_path(),
                 session.execution.clone(),
@@ -182,6 +186,9 @@ fn apply_overrides(cfg: &mut Config, args: &Args) -> anyhow::Result<()> {
     }
     if args.testnet {
         cfg.network = Network::Testnet;
+    }
+    if args.no_hip3 {
+        cfg.include_hip3 = false;
     }
     cfg.validate()?;
     Ok(())
@@ -428,21 +435,5 @@ fn chain(network: Network) -> Chain {
     match network {
         Network::Mainnet => Chain::Mainnet,
         Network::Testnet => Chain::Testnet,
-    }
-}
-
-struct ReadOnlyExecutor;
-
-impl CommandExecutor for ReadOnlyExecutor {
-    fn execute_command<'a>(&'a self, _: hl_v2::command::Command) -> ExecuteFuture<'a> {
-        Box::pin(async { Err("daemon is read-only".to_string()) })
-    }
-
-    fn execute_command_for<'a>(
-        &'a self,
-        _: &'a str,
-        _: hl_v2::command::Command,
-    ) -> ExecuteFuture<'a> {
-        Box::pin(async { Err("daemon is read-only".to_string()) })
     }
 }

@@ -1,4 +1,4 @@
-// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed HTTP server test and added R-01, R-07, R-09, and R-10 boundary checks.
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed HTTP server test and added R-01, R-03, R-07, R-09, and R-10 boundary checks.
 mod support;
 
 use std::{collections::BTreeMap, fs, path::PathBuf};
@@ -346,4 +346,477 @@ fn r10_password_file_kdf_floors_and_debug_redaction_enforced() {
 
         fs::remove_dir_all(dir).unwrap();
     }
+}
+
+#[tokio::test]
+async fn r03_include_hip3_defaults_true_and_no_hip3_guards_startup_and_live_exposure() {
+    use futures_util::{SinkExt, StreamExt};
+    use hl_v2::{
+        execution::ExecutionControl,
+        feed::apply_ws_message_for,
+        info::InfoClient,
+        ipc::{IpcApp, IpcRequest, IpcResponse},
+        metrics::Metrics,
+        runtime::{CommandQueue, CommandService, ReadOnlyExecutor},
+    };
+    use serde_json::{Value, json};
+    use std::{collections::BTreeSet, sync::Arc};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::RwLock,
+    };
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    let dir = temp_dir("r03-hip3");
+    fs::create_dir_all(&dir).unwrap();
+
+    // (1) Default Config enables full market access (`include_hip3 == true`, `allowed_symbols == []`).
+    let defaults = Config::defaults(dir.clone());
+    assert!(defaults.include_hip3);
+    assert!(defaults.allowed_symbols.is_empty());
+
+    // (2) `includeHip3 = false` rejects `dex:COIN` in `defaultSymbol` or `allowedSymbols` and accepts native symbols.
+    for rejected_json in [
+        r#"{"network":"Testnet","includeHip3":false,"defaultSymbol":"xyz:TSLA"}"#,
+        r#"{"network":"Testnet","includeHip3":false,"defaultSymbol":"BTC","allowedSymbols":["BTC","xyz:TSLA"]}"#,
+    ] {
+        fs::write(dir.join("hl-v2.json"), rejected_json).unwrap();
+        let err = Config::load(Some(dir.clone())).unwrap_err().to_string();
+        assert!(
+            err.contains("includeHip3"),
+            "expected HIP-3 config error for {rejected_json}, got: {err}"
+        );
+    }
+    fs::write(
+        dir.join("hl-v2.json"),
+        r#"{"network":"Testnet","includeHip3":false,"defaultSymbol":"BTC"}"#,
+    )
+    .unwrap();
+    let valid_no_hip3 = Config::load(Some(dir.clone())).unwrap();
+    assert!(!valid_no_hip3.include_hip3);
+
+    async fn spawn_hip3_mock_exchange(
+        user: String,
+        all_dexs_states: Value,
+        xyz_open_orders: Value,
+    ) -> (
+        String,
+        String,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let info_url = format!("http://{}/info", http_listener.local_addr().unwrap());
+        let http_handle = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = http_listener.accept().await {
+                let xyz_open_orders = xyz_open_orders.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    let header_end = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&buf[..header_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_len {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let req: Value =
+                        serde_json::from_slice(&buf[header_end..header_end + content_len]).unwrap();
+                    let resp = match req.get("type").and_then(Value::as_str) {
+                        Some("perpDexs") => json!([null, {"name": "xyz"}]),
+                        Some("allPerpMetas") => json!([
+                            {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]},
+                            {"universe": [{"name": "xyz:TSLA", "szDecimals": 2, "maxLeverage": 10}]}
+                        ]),
+                        Some("spotMetaAndAssetCtxs") => json!([
+                            {
+                                "tokens": [
+                                    {"name": "USDC", "szDecimals": 8, "index": 0},
+                                    {"name": "PURR", "szDecimals": 0, "index": 1}
+                                ],
+                                "universe": [
+                                    {"name": "PURR/USDC", "index": 0, "tokens": [1, 0]}
+                                ]
+                            },
+                            []
+                        ]),
+                        Some("l2Book") => json!({
+                            "levels": [
+                                [{"px": "50000.0", "sz": "1.0", "n": 1}],
+                                [{"px": "50001.0", "sz": "1.0", "n": 1}]
+                            ]
+                        }),
+                        Some("clearinghouseState") => json!({
+                            "marginSummary": {
+                                "accountValue": "1000.0",
+                                "totalMarginUsed": "0.0",
+                                "totalNtlPos": "0.0"
+                            },
+                            "withdrawable": "1000.0",
+                            "assetPositions": []
+                        }),
+                        Some("frontendOpenOrders") => {
+                            if req.get("dex").and_then(Value::as_str) == Some("xyz") {
+                                xyz_open_orders
+                            } else {
+                                json!([])
+                            }
+                        }
+                        Some("userAbstraction") => json!("standard"),
+                        Some("spotClearinghouseState") => json!({
+                            "balances": [
+                                {"coin": "USDC", "token": 0, "total": "500.0", "hold": "0.0", "entryNtl": "500.0"}
+                            ]
+                        }),
+                        Some("allMids") => json!({"PURR/USDC": "1.25", "BTC": "50000.5"}),
+                        Some("borrowLendUserState") => {
+                            json!({"tokenToState": [], "health": "healthy"})
+                        }
+                        Some("activeAssetData") => json!({
+                            "leverage": {"type": "cross", "value": 10},
+                            "maxTradeSzs": ["10.0", "10.0"],
+                            "availableToTrade": ["1000.0", "1000.0"],
+                            "markPx": "50000.5"
+                        }),
+                        other => panic!("unexpected /info request type {other:?}"),
+                    };
+                    let body = serde_json::to_vec(&resp).unwrap();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                });
+            }
+        });
+
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_url = format!("ws://{}", ws_listener.local_addr().unwrap());
+        let ws_handle = tokio::spawn(async move {
+            while let Ok((stream, _)) = ws_listener.accept().await {
+                let user = user.clone();
+                let all_dexs_states = all_dexs_states.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(msg)) = ws.next().await {
+                        match msg {
+                            Message::Text(text) => {
+                                let Ok(req) = serde_json::from_str::<Value>(text.as_ref()) else {
+                                    continue;
+                                };
+                                match req.pointer("/subscription/type").and_then(Value::as_str) {
+                                    Some("openOrders") => {
+                                        let dex = req
+                                            .pointer("/subscription/dex")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("");
+                                        let reply = json!({
+                                            "channel": "openOrders",
+                                            "data": {
+                                                "user": user,
+                                                "dex": dex,
+                                                "orders": []
+                                            }
+                                        });
+                                        let _ =
+                                            ws.send(Message::Text(reply.to_string().into())).await;
+                                    }
+                                    Some("allDexsClearinghouseState") => {
+                                        let reply = json!({
+                                            "channel": "allDexsClearinghouseState",
+                                            "data": {
+                                                "user": user,
+                                                "clearinghouseStates": all_dexs_states
+                                            }
+                                        });
+                                        let _ =
+                                            ws.send(Message::Text(reply.to_string().into())).await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Message::Close(_) => {
+                                let _ = ws.close(None).await;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        (info_url, ws_url, http_handle, ws_handle)
+    }
+
+    let user = "0x1111111111111111111111111111111111111111".to_string();
+
+    // Default `seed_state` (`include_hip3 == true`) loads native Perp (`BTC`), Spot (`SPOT:PURR/USDC`), and HIP-3 (`XYZ:TSLA`).
+    {
+        let (info_url, ws_url, http_h, ws_h) = spawn_hip3_mock_exchange(
+            user.clone(),
+            json!([["", {"assetPositions": [], "marginSummary": {"accountValue": "1000.0", "totalMarginUsed": "0.0", "totalNtlPos": "0.0"}, "withdrawable": "1000.0"}]]),
+            json!([]),
+        )
+        .await;
+        let client = InfoClient::new(Network::Testnet)
+            .with_info_url(info_url)
+            .with_ws_url(ws_url);
+        let seeded = client
+            .seed_state("BTC", &BTreeSet::new(), Some(&user))
+            .await
+            .unwrap();
+        assert!(seeded.include_hip3);
+        assert!(seeded.markets.contains_key("BTC"));
+        assert!(seeded.markets.contains_key("SPOT:PURR/USDC"));
+        assert!(seeded.markets.contains_key("XYZ:TSLA"));
+        http_h.abort();
+        ws_h.abort();
+    }
+
+    // `include_hip3 == false` succeeds when non-root DEXes have zero positions/margin/orders and excludes `XYZ:TSLA`.
+    {
+        let (info_url, ws_url, http_h, ws_h) = spawn_hip3_mock_exchange(
+            user.clone(),
+            json!([
+                ["", {"assetPositions": [], "marginSummary": {"accountValue": "1000.0", "totalMarginUsed": "0.0", "totalNtlPos": "0.0"}, "withdrawable": "1000.0"}],
+                ["xyz", {"assetPositions": [], "marginSummary": {"accountValue": "0.0", "totalMarginUsed": "0.0", "totalNtlPos": "0.0"}, "withdrawable": "0.0"}]
+            ]),
+            json!([]),
+        )
+        .await;
+        let client = InfoClient::new(Network::Testnet)
+            .with_info_url(info_url)
+            .with_ws_url(ws_url);
+        let seeded = client
+            .seed_state_with_options("BTC", &BTreeSet::new(), Some(&user), false)
+            .await
+            .unwrap();
+        assert!(!seeded.include_hip3);
+        assert!(seeded.markets.contains_key("BTC"));
+        assert!(seeded.markets.contains_key("SPOT:PURR/USDC"));
+        assert!(!seeded.markets.contains_key("XYZ:TSLA"));
+        http_h.abort();
+        ws_h.abort();
+    }
+
+    // (3) + Sensitivity Hint #3: `include_hip3 == false` fails closed naming `"xyz"` when `allDexsClearinghouseState`
+    // reports non-zero `szi` (`-1.5`), `totalMarginUsed > 0`, or open orders on DEX `"xyz"`.
+    {
+        let (info_url, ws_url, http_h, ws_h) = spawn_hip3_mock_exchange(
+            user.clone(),
+            json!([
+                ["", {"assetPositions": [], "marginSummary": {"accountValue": "1000.0", "totalMarginUsed": "0.0", "totalNtlPos": "0.0"}, "withdrawable": "1000.0"}],
+                ["xyz", {
+                    "assetPositions": [
+                        {"position": {"coin": "xyz:TSLA", "szi": "-1.5"}}
+                    ],
+                    "marginSummary": {"accountValue": "250.0", "totalMarginUsed": "0.0", "totalNtlPos": "300.0"},
+                    "withdrawable": "250.0"
+                }]
+            ]),
+            json!([]),
+        )
+        .await;
+        let client = InfoClient::new(Network::Testnet)
+            .with_info_url(info_url)
+            .with_ws_url(ws_url);
+        let err = client
+            .seed_state_with_options("BTC", &BTreeSet::new(), Some(&user), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("xyz"),
+            "expected startup error naming xyz for short exposure, got: {err}"
+        );
+        http_h.abort();
+        ws_h.abort();
+    }
+
+    {
+        let (info_url, ws_url, http_h, ws_h) = spawn_hip3_mock_exchange(
+            user.clone(),
+            json!([
+                ["", {"assetPositions": [], "marginSummary": {"accountValue": "1000.0", "totalMarginUsed": "0.0", "totalNtlPos": "0.0"}, "withdrawable": "1000.0"}],
+                ["xyz", {
+                    "assetPositions": [],
+                    "marginSummary": {"accountValue": "250.0", "totalMarginUsed": "12.5", "totalNtlPos": "0.0"},
+                    "withdrawable": "237.5"
+                }]
+            ]),
+            json!([]),
+        )
+        .await;
+        let client = InfoClient::new(Network::Testnet)
+            .with_info_url(info_url)
+            .with_ws_url(ws_url);
+        let err = client
+            .seed_state_with_options("BTC", &BTreeSet::new(), Some(&user), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("xyz"),
+            "expected startup error naming xyz for totalMarginUsed > 0, got: {err}"
+        );
+        http_h.abort();
+        ws_h.abort();
+    }
+
+    {
+        let (info_url, ws_url, http_h, ws_h) = spawn_hip3_mock_exchange(
+            user.clone(),
+            json!([
+                ["", {"assetPositions": [], "marginSummary": {"accountValue": "1000.0", "totalMarginUsed": "0.0", "totalNtlPos": "0.0"}, "withdrawable": "1000.0"}],
+                ["xyz", {
+                    "assetPositions": [],
+                    "marginSummary": {"accountValue": "250.0", "totalMarginUsed": "0.0", "totalNtlPos": "0.0"},
+                    "withdrawable": "250.0"
+                }]
+            ]),
+            json!([{"oid": 991_u64, "coin": "xyz:TSLA", "side": "B", "limitPx": "180.0", "sz": "1.0"}]),
+        )
+        .await;
+        let client = InfoClient::new(Network::Testnet)
+            .with_info_url(info_url)
+            .with_ws_url(ws_url);
+        let err = client
+            .seed_state_with_options("BTC", &BTreeSet::new(), Some(&user), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("xyz"),
+            "expected startup error naming xyz for open order, got: {err}"
+        );
+        http_h.abort();
+        ws_h.abort();
+    }
+
+    // (4) Live WS `allDexsClearinghouseState` or `userFills` with `include_hip3 == false` persistently degrades health (`HealthPayload.ok = false`) and `doctor`.
+    {
+        let mut base = support::ready_perp("0");
+        base.include_hip3 = false;
+        let state = Arc::new(RwLock::new(base));
+        let metrics = Metrics::default();
+        metrics.state_ws_connected();
+        let execution = ExecutionControl::default();
+        let service = Arc::new(
+            CommandService::new(state.clone(), Arc::new(ReadOnlyExecutor)).with_diagnostics(
+                metrics.clone(),
+                execution.clone(),
+                None,
+            ),
+        );
+        let app = IpcApp::new(
+            state.clone(),
+            metrics,
+            CommandQueue::new(service.clone()).unwrap(),
+        )
+        .with_execution_control(execution);
+
+        match app.dispatch(IpcRequest::Health).await {
+            IpcResponse::Health(payload) => assert!(payload.ok),
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let watched = BTreeSet::from(["BTC".to_string()]);
+        let live_ch_msg = json!({
+            "channel": "allDexsClearinghouseState",
+            "data": {
+                "user": user,
+                "clearinghouseStates": [
+                    ["", {"assetPositions": [], "marginSummary": {"accountValue": "1000.0", "totalMarginUsed": "0.0", "totalNtlPos": "0.0"}, "withdrawable": "1000.0"}],
+                    ["xyz", {"assetPositions": [{"position": {"coin": "xyz:TSLA", "szi": "2.0"}}], "marginSummary": {"accountValue": "500.0", "totalMarginUsed": "50.0", "totalNtlPos": "400.0"}, "withdrawable": "450.0"}]
+                ]
+            }
+        })
+        .to_string();
+        apply_ws_message_for(&state, &live_ch_msg, Some(&user), &watched)
+            .await
+            .unwrap();
+
+        match app.dispatch(IpcRequest::Health).await {
+            IpcResponse::Health(payload) => {
+                assert!(!payload.ok);
+                assert!(payload.reasons.iter().any(|r| r.contains("xyz")));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        let doctor = service.execute_line("doctor").await;
+        assert!(!doctor.ok);
+        assert!(doctor.lines.iter().any(|line| line.contains("xyz")));
+
+        // Verify live `userFills` for `dex:COIN` also triggers the persistent health guard on a clean `--no-hip3` state.
+        let mut base2 = support::ready_perp("0");
+        base2.include_hip3 = false;
+        let state2 = Arc::new(RwLock::new(base2));
+        let metrics2 = Metrics::default();
+        metrics2.state_ws_connected();
+        let service2 = Arc::new(CommandService::new(
+            state2.clone(),
+            Arc::new(ReadOnlyExecutor),
+        ));
+        let app2 = IpcApp::new(
+            state2.clone(),
+            metrics2,
+            CommandQueue::new(service2).unwrap(),
+        );
+        let live_fill_msg = json!({
+            "channel": "userFills",
+            "data": {
+                "user": user,
+                "fills": [
+                    {
+                        "coin": "xyz:NVDA",
+                        "px": "130.5",
+                        "sz": "1.0",
+                        "side": "B",
+                        "time": now_ms(),
+                        "oid": 555_u64,
+                        "tid": 777_u64,
+                        "closedPnl": "0.0"
+                    }
+                ]
+            }
+        })
+        .to_string();
+        apply_ws_message_for(&state2, &live_fill_msg, Some(&user), &watched)
+            .await
+            .unwrap();
+        match app2.dispatch(IpcRequest::Health).await {
+            IpcResponse::Health(payload) => {
+                assert!(!payload.ok);
+                assert!(payload.reasons.iter().any(|r| r.contains("xyz")));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    fs::remove_dir_all(dir).unwrap();
 }

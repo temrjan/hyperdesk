@@ -15,7 +15,7 @@ use crate::{
     catalog,
     command::{self, Command, MarketFilter},
     config::Config,
-    core::CommandExecutor,
+    core::{CommandExecutor, ExecuteFuture},
     exchange::ActionConnectionHealth,
     execution::{ExecutionControl, ExecutionStatus, OrderStatus, SubmitReceipt},
     metrics::Metrics,
@@ -99,6 +99,7 @@ struct RuntimeConfig {
     network: String,
     default_symbol: String,
     allowed_symbols: Vec<String>,
+    include_hip3: bool,
     symbol_aliases: BTreeMap<String, String>,
     vault: bool,
     required_account_mode: Option<String>,
@@ -111,6 +112,7 @@ impl RuntimeConfig {
             network: format!("{:?}", cfg.network),
             default_symbol: cfg.default_symbol.clone(),
             allowed_symbols: cfg.allowed_symbols.iter().cloned().collect(),
+            include_hip3: cfg.include_hip3,
             symbol_aliases: cfg.symbol_aliases.clone(),
             vault: cfg.vault_address.is_some(),
             required_account_mode: cfg.required_account_mode.clone(),
@@ -130,6 +132,7 @@ impl RuntimeConfig {
                     self.allowed_symbols.join(",")
                 }
             ),
+            format!("include_hip3={}", self.include_hip3),
             format!("symbol_aliases={}", self.aliases_line()),
             format!("vault={}", self.vault),
             format!(
@@ -149,6 +152,7 @@ impl RuntimeConfig {
             } else {
                 self.allowed_symbols.join(",")
             }),
+            "include-hip3" | "include_hip3" => Some(self.include_hip3.to_string()),
             "symbol-aliases" | "symbol_aliases" | "aliases" => Some(self.aliases_line()),
             "vault" | "vault-address" | "vault_address" => Some(self.vault.to_string()),
             "required-account-mode" | "required_account_mode" => Some(
@@ -640,16 +644,19 @@ impl CommandService {
             Ok(symbol) => symbol,
             Err(err) => return CommandResponse::err(err),
         };
-        let readiness = {
+        let (readiness, untracked_hip3_warning) = {
             let state = self.state.read().await;
-            state.readiness_for(
-                &symbol,
-                now_ms(),
-                FreshnessLimits::default(),
-                true,
-                state
-                    .position(&symbol)
-                    .is_none_or(|position| position.value.flat()),
+            (
+                state.readiness_for(
+                    &symbol,
+                    now_ms(),
+                    FreshnessLimits::default(),
+                    true,
+                    state
+                        .position(&symbol)
+                        .is_none_or(|position| position.value.flat()),
+                ),
+                state.untracked_hip3_warning.clone(),
             )
         };
         let Some(diagnostics) = &self.diagnostics else {
@@ -662,6 +669,9 @@ impl CommandService {
             .map(ActionConnectionHealth::connected);
         let state_feed = diagnostics.metrics.state_feed_connected();
         let mut reasons = readiness.reasons;
+        if let Some(warning) = untracked_hip3_warning.as_ref() {
+            reasons.push(warning.clone());
+        }
         if let Some(reason) = execution.reason.as_deref() {
             reasons.push(format!("execution halted: {reason}"));
         }
@@ -672,6 +682,7 @@ impl CommandService {
             reasons.push("state feed disconnected".to_string());
         }
         let ok = readiness.ready
+            && untracked_hip3_warning.is_none()
             && !execution.halted
             && action.unwrap_or(true)
             && state_feed.unwrap_or(true);
@@ -1738,4 +1749,16 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+pub struct ReadOnlyExecutor;
+
+impl CommandExecutor for ReadOnlyExecutor {
+    fn execute_command<'a>(&'a self, _: Command) -> ExecuteFuture<'a> {
+        Box::pin(async { Err("daemon is read-only".to_string()) })
+    }
+
+    fn execute_command_for<'a>(&'a self, _: &'a str, _: Command) -> ExecuteFuture<'a> {
+        Box::pin(async { Err("daemon is read-only".to_string()) })
+    }
 }

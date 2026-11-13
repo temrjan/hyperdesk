@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): added R-05 orderStatus + userFills VWAP reconciliation and R-06 marketCrossBps propagation tests.
 mod support;
 
 use std::{
@@ -1364,4 +1365,561 @@ async fn persisted_degraded_attachment_retirement_requires_definitive_fresh_empt
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(persisted["entryProtections"], serde_json::json!([]));
     std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn r06_managed_executor_propagates_custom_market_cross_bps() {
+    use hl_v2::state::Book;
+
+    // 1. Protected market entry (`buy 0.1 sl 49000`) at 150 bps crosses at 50000 * 1.015 = 50750 (not 50250).
+    let mut initial = ready_perp("0");
+    let now = now_ms();
+    initial.apply_book(
+        "BTC",
+        Book {
+            bid: dec("50000"),
+            ask: dec("50000"),
+        },
+        now,
+        Some(now),
+    );
+    let state = Arc::new(RwLock::new(initial));
+    let inner = Arc::new(RecordingPlanExecutor::new(state.clone()));
+    let managed = ManagedExecutor::spawn_with_market_cross_bps(
+        state.clone(),
+        inner.clone(),
+        Duration::from_millis(5),
+        150,
+    );
+    managed
+        .execute_command(command::parse("buy 0.1 sl 49000"))
+        .await
+        .unwrap();
+    let buy_entry_price = {
+        let plans = inner.plans.lock().unwrap();
+        let Action::Order(batch) = &plans[0].action else {
+            panic!("expected entry order batch");
+        };
+        batch.orders[0].price
+    };
+    assert_eq!(buy_entry_price, dec("50750"));
+
+    // 2. Trailing-attached market entry (`sell 0.1 trail 1%`) at 150 bps crosses at 50000 * 0.985 = 49250 (not 49750).
+    let mut initial_sell = ready_perp("0");
+    let now = now_ms();
+    initial_sell.apply_book(
+        "BTC",
+        Book {
+            bid: dec("50000"),
+            ask: dec("50000"),
+        },
+        now,
+        Some(now),
+    );
+    let state_sell = Arc::new(RwLock::new(initial_sell));
+    let inner_sell = Arc::new(RecordingPlanExecutor::new(state_sell.clone()));
+    let managed_sell = ManagedExecutor::spawn_with_market_cross_bps(
+        state_sell.clone(),
+        inner_sell.clone(),
+        Duration::from_millis(5),
+        150,
+    );
+    managed_sell
+        .execute_command(command::parse("sell 0.1 trail 1%"))
+        .await
+        .unwrap();
+    let sell_entry_price = {
+        let plans = inner_sell.plans.lock().unwrap();
+        let Action::Order(batch) = &plans[0].action else {
+            panic!("expected sell entry order batch");
+        };
+        batch.orders[0].price
+    };
+    assert_eq!(sell_entry_price, dec("49250"));
+}
+
+#[tokio::test]
+async fn r05_reconciled_ws_timeout_preserves_fills_vwap_empty_price_safety_and_terminal_oid() {
+    use alloy_primitives::B256;
+    use alloy_signer_local::PrivateKeySigner;
+    use hl_v2::{
+        core::{ActionTransport, Core, TransportFuture},
+        exchange::{ExchangeResponse, Network, OkResponse},
+        execution::{ActionJournal, TransportError},
+        info::{InfoClient, InfoReconciler},
+        metrics::Metrics,
+        protocol::{ActionRequest, Chain, OrderGrouping},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct TimeoutEntryTransport {
+        actions: Mutex<Vec<Action>>,
+        next_oid: AtomicU64,
+    }
+
+    impl ActionTransport for TimeoutEntryTransport {
+        fn post_action<'a>(
+            &'a self,
+            request: ActionRequest,
+            _timeout: Duration,
+        ) -> TransportFuture<'a> {
+            self.actions.lock().unwrap().push(request.action.clone());
+            Box::pin(async move {
+                match &request.action {
+                    Action::Order(batch) if batch.grouping == OrderGrouping::Na => {
+                        Err(TransportError::Timeout {
+                            id: 1,
+                            timeout_ms: 50,
+                        })
+                    }
+                    Action::Order(batch) => {
+                        let statuses = batch
+                            .orders
+                            .iter()
+                            .map(|order| OrderStatus::Resting {
+                                oid: self.next_oid.fetch_add(1, Ordering::Relaxed),
+                                cloid: Some(order.cloid.to_string()),
+                            })
+                            .collect();
+                        Ok(ExchangeResponse::Ok(OkResponse::Order { statuses }))
+                    }
+                    Action::TrailingStop(_) => {
+                        let oid = self.next_oid.fetch_add(1, Ordering::Relaxed);
+                        Ok(ExchangeResponse::Ok(OkResponse::TrailingStop { oid }))
+                    }
+                    Action::Cancel(_) | Action::CancelByCloid(_) => {
+                        Ok(ExchangeResponse::Ok(OkResponse::Cancel {
+                            statuses: vec![OrderStatus::Success],
+                        }))
+                    }
+                    other => panic!("unexpected action on mock transport: {other:?}"),
+                }
+            })
+        }
+    }
+
+    async fn spawn_mock_info_server(
+        order_status_fn: impl Fn(String) -> serde_json::Value + Send + Sync + 'static,
+        user_fills: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/info", listener.local_addr().unwrap());
+        let order_status_fn = Arc::new(order_status_fn);
+        let handle = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let order_status_fn = order_status_fn.clone();
+                let user_fills = user_fills.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 16_384];
+                    let mut read = 0_usize;
+                    let header_end = loop {
+                        let n = match sock.read(&mut buf[read..]).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        read += n;
+                        if let Some(pos) = buf[..read].windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&buf[..header_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while read < header_end + content_len {
+                        let n = match sock.read(&mut buf[read..]).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        read += n;
+                    }
+                    let req: serde_json::Value =
+                        serde_json::from_slice(&buf[header_end..header_end + content_len]).unwrap();
+                    let resp_json = match req.get("type").and_then(serde_json::Value::as_str) {
+                        Some("orderStatus") => {
+                            let cloid = req["oid"].as_str().unwrap_or_default().to_string();
+                            order_status_fn(cloid)
+                        }
+                        Some("userFills") => user_fills,
+                        other => panic!("unexpected /info type {other:?}"),
+                    };
+                    let body = serde_json::to_vec(&resp_json).unwrap();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                });
+            }
+        });
+        (url, handle)
+    }
+
+    let user = "0x1111111111111111111111111111111111111111".to_string();
+
+    // Case (1): Full fill reconciled with userFills VWAP = 50010 (limitPx = 50250 ignored).
+    {
+        let (url, server) = spawn_mock_info_server(
+            |cloid| {
+                serde_json::json!({
+                    "status": "order",
+                    "order": {
+                        "status": "filled",
+                        "order": {
+                            "oid": 7001_u64,
+                            "cloid": cloid,
+                            "coin": "BTC",
+                            "side": "B",
+                            "limitPx": "50250.0",
+                            "origSz": "0.1",
+                            "sz": "0.0"
+                        }
+                    }
+                })
+            },
+            serde_json::json!([
+                {"oid": 7001_u64, "px": "50000.0", "sz": "0.05"},
+                {"oid": 7001_u64, "px": "50020.0", "sz": "0.05"}
+            ]),
+        )
+        .await;
+        let journal_path = std::env::temp_dir().join(format!(
+            "hl-v2-r05-c1-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let state = Arc::new(RwLock::new(ready_perp("0")));
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x21)).unwrap();
+        let transport = Arc::new(TimeoutEntryTransport {
+            actions: Mutex::new(Vec::new()),
+            next_oid: AtomicU64::new(8000),
+        });
+        struct SharedTransport(Arc<TimeoutEntryTransport>);
+        impl ActionTransport for SharedTransport {
+            fn post_action<'a>(
+                &'a self,
+                request: ActionRequest,
+                timeout: Duration,
+            ) -> TransportFuture<'a> {
+                self.0.post_action(request, timeout)
+            }
+        }
+        let info_client = InfoClient::new(Network::Testnet).with_info_url(url);
+        let reconciler = Arc::new(InfoReconciler::new(
+            info_client,
+            user.clone(),
+            state.clone(),
+        ));
+        let core = Arc::new(
+            Core::from_shared_state(
+                state.clone(),
+                ActionJournal::new(&journal_path),
+                signer,
+                SharedTransport(transport.clone()),
+                Chain::Testnet,
+                Metrics::default(),
+            )
+            .with_reconciler(reconciler),
+        );
+        let managed = ManagedExecutor::spawn(state.clone(), core, Duration::from_millis(5));
+        let receipt = managed
+            .execute_command(command::parse("buy 0.1 sl 49000 tp 52000"))
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ExecutionStatus::Accepted);
+
+        let pos = state.read().await.position("BTC").unwrap().value.clone();
+        assert_eq!(pos.size, dec("0.1"));
+        assert_eq!(pos.entry_price, Some(dec("50010")));
+
+        let actions = transport.actions.lock().unwrap().clone();
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Order(b)
+                if b.grouping == OrderGrouping::PositionTpsl
+                    && b.orders.iter().any(|o| o.size == dec("0.1") && matches!(o.order_type, OrderType::Trigger { tpsl: TpSl::Sl, .. }))
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Order(b)
+                if b.grouping == OrderGrouping::PositionTpsl
+                    && b.orders.iter().any(|o| o.size == dec("0.1") && matches!(o.order_type, OrderType::Trigger { tpsl: TpSl::Tp, .. }))
+        )));
+        server.abort();
+        let _ = std::fs::remove_file(journal_path);
+    }
+
+    // Case (1b): Full fill reconciled with userFills VWAP = 50010 also arms native TrailingStop sized 0.1.
+    {
+        let (url, server) = spawn_mock_info_server(
+            |cloid| {
+                serde_json::json!({
+                    "status": "order",
+                    "order": {
+                        "status": "filled",
+                        "order": {
+                            "oid": 7011_u64,
+                            "cloid": cloid,
+                            "coin": "BTC",
+                            "side": "B",
+                            "limitPx": "50250.0",
+                            "origSz": "0.1",
+                            "sz": "0.0"
+                        }
+                    }
+                })
+            },
+            serde_json::json!([
+                {"oid": 7011_u64, "px": "50010.0", "sz": "0.1"}
+            ]),
+        )
+        .await;
+        let journal_path = std::env::temp_dir().join(format!(
+            "hl-v2-r05-c1b-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let state = Arc::new(RwLock::new(ready_perp("0")));
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x24)).unwrap();
+        let transport = Arc::new(TimeoutEntryTransport {
+            actions: Mutex::new(Vec::new()),
+            next_oid: AtomicU64::new(8050),
+        });
+        struct SharedTransport(Arc<TimeoutEntryTransport>);
+        impl ActionTransport for SharedTransport {
+            fn post_action<'a>(
+                &'a self,
+                request: ActionRequest,
+                timeout: Duration,
+            ) -> TransportFuture<'a> {
+                self.0.post_action(request, timeout)
+            }
+        }
+        let info_client = InfoClient::new(Network::Testnet).with_info_url(url);
+        let reconciler = Arc::new(InfoReconciler::new(
+            info_client,
+            user.clone(),
+            state.clone(),
+        ));
+        let core = Arc::new(
+            Core::from_shared_state(
+                state.clone(),
+                ActionJournal::new(&journal_path),
+                signer,
+                SharedTransport(transport.clone()),
+                Chain::Testnet,
+                Metrics::default(),
+            )
+            .with_reconciler(reconciler),
+        );
+        let managed = ManagedExecutor::spawn(state.clone(), core, Duration::from_millis(5));
+        let receipt = managed
+            .execute_command(command::parse("buy 0.1 tp 52000 trail 1%"))
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ExecutionStatus::Accepted);
+
+        let pos = state.read().await.position("BTC").unwrap().value.clone();
+        assert_eq!(pos.size, dec("0.1"));
+        assert_eq!(pos.entry_price, Some(dec("50010")));
+
+        let actions = transport.actions.lock().unwrap().clone();
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::TrailingStop(t) if t.size == dec("0.1")
+        )));
+        server.abort();
+        let _ = std::fs::remove_file(journal_path);
+    }
+
+    // Case (2) + Sensitivity Hint #2: Partial-fill cancel (`origSz="0.1", sz="0.04"`) with empty `userFills`
+    // places tp/sl sized 0.06, sets position.size = 0.06, and keeps entry_price == None (never limitPx 50250).
+    {
+        let (url, server) = spawn_mock_info_server(
+            |cloid| {
+                serde_json::json!({
+                    "status": "order",
+                    "order": {
+                        "status": "canceled",
+                        "order": {
+                            "oid": 7002_u64,
+                            "cloid": cloid,
+                            "coin": "BTC",
+                            "side": "B",
+                            "limitPx": "50250.0",
+                            "origSz": "0.1",
+                            "sz": "0.04"
+                        }
+                    }
+                })
+            },
+            serde_json::json!([]),
+        )
+        .await;
+        let journal_path = std::env::temp_dir().join(format!(
+            "hl-v2-r05-c2-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let state = Arc::new(RwLock::new(ready_perp("0")));
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x22)).unwrap();
+        let transport = Arc::new(TimeoutEntryTransport {
+            actions: Mutex::new(Vec::new()),
+            next_oid: AtomicU64::new(8100),
+        });
+        struct SharedTransport(Arc<TimeoutEntryTransport>);
+        impl ActionTransport for SharedTransport {
+            fn post_action<'a>(
+                &'a self,
+                request: ActionRequest,
+                timeout: Duration,
+            ) -> TransportFuture<'a> {
+                self.0.post_action(request, timeout)
+            }
+        }
+        let info_client = InfoClient::new(Network::Testnet).with_info_url(url);
+        let reconciler = Arc::new(InfoReconciler::new(
+            info_client,
+            user.clone(),
+            state.clone(),
+        ));
+        let core = Arc::new(
+            Core::from_shared_state(
+                state.clone(),
+                ActionJournal::new(&journal_path),
+                signer,
+                SharedTransport(transport.clone()),
+                Chain::Testnet,
+                Metrics::default(),
+            )
+            .with_reconciler(reconciler),
+        );
+        let managed = ManagedExecutor::spawn(state.clone(), core, Duration::from_millis(5));
+        let receipt = managed
+            .execute_command(command::parse("buy 0.1 sl 49000 tp 52000"))
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ExecutionStatus::Accepted);
+
+        let snapshot = state.read().await;
+        let pos = snapshot.position("BTC").unwrap().value.clone();
+        assert_eq!(pos.size, dec("0.06"));
+        assert_eq!(
+            pos.entry_price, None,
+            "limitPx must never pollute entry_price"
+        );
+        assert!(
+            Planner::default()
+                .plan(&snapshot, command::parse("sl $entry-100"))
+                .is_err(),
+            "$entry reference must fail cleanly when entry_price is None"
+        );
+        drop(snapshot);
+
+        let actions = transport.actions.lock().unwrap().clone();
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Order(b)
+                if b.grouping == OrderGrouping::PositionTpsl
+                    && b.orders.iter().any(|o| o.size == dec("0.06") && matches!(o.order_type, OrderType::Trigger { tpsl: TpSl::Sl, .. }))
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Order(b)
+                if b.grouping == OrderGrouping::PositionTpsl
+                    && b.orders.iter().any(|o| o.size == dec("0.06") && matches!(o.order_type, OrderType::Trigger { tpsl: TpSl::Tp, .. }))
+        )));
+        server.abort();
+        let _ = std::fs::remove_file(journal_path);
+    }
+
+    // Case (3): Zero-fill `marginCanceled` places zero brackets and preserves `oid` in `recovered_order_outcomes`.
+    {
+        let (url, server) = spawn_mock_info_server(
+            |cloid| {
+                serde_json::json!({
+                    "status": "order",
+                    "order": {
+                        "status": "marginCanceled",
+                        "order": {
+                            "oid": 7003_u64,
+                            "cloid": cloid,
+                            "coin": "BTC",
+                            "side": "B",
+                            "limitPx": "50250.0",
+                            "origSz": "0.1",
+                            "sz": "0.1"
+                        }
+                    }
+                })
+            },
+            serde_json::json!([]),
+        )
+        .await;
+        let journal_path = std::env::temp_dir().join(format!(
+            "hl-v2-r05-c3-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let state = Arc::new(RwLock::new(ready_perp("0")));
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x23)).unwrap();
+        let transport = Arc::new(TimeoutEntryTransport {
+            actions: Mutex::new(Vec::new()),
+            next_oid: AtomicU64::new(8200),
+        });
+        struct SharedTransport(Arc<TimeoutEntryTransport>);
+        impl ActionTransport for SharedTransport {
+            fn post_action<'a>(
+                &'a self,
+                request: ActionRequest,
+                timeout: Duration,
+            ) -> TransportFuture<'a> {
+                self.0.post_action(request, timeout)
+            }
+        }
+        let info_client = InfoClient::new(Network::Testnet).with_info_url(url);
+        let reconciler = Arc::new(InfoReconciler::new(info_client, user, state.clone()));
+        let core = Arc::new(
+            Core::from_shared_state(
+                state.clone(),
+                ActionJournal::new(&journal_path),
+                signer,
+                SharedTransport(transport.clone()),
+                Chain::Testnet,
+                Metrics::default(),
+            )
+            .with_reconciler(reconciler),
+        );
+        let managed = ManagedExecutor::spawn(state.clone(), core, Duration::from_millis(5));
+        let receipt = managed
+            .execute_command(command::parse("buy 0.1 sl 49000"))
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ExecutionStatus::Accepted);
+
+        let actions = transport.actions.lock().unwrap().clone();
+        assert_eq!(
+            actions.len(),
+            1,
+            "zero-fill cancel must place zero brackets"
+        );
+
+        let snapshot = state.read().await;
+        assert_eq!(snapshot.recovered_order_outcomes.len(), 1);
+        let outcome = snapshot.recovered_order_outcomes.values().next().unwrap();
+        assert_eq!(outcome.oid, Some(7003));
+        assert_eq!(outcome.filled_size, Decimal::ZERO);
+        assert!(outcome.terminal);
+        drop(snapshot);
+
+        server.abort();
+        let _ = std::fs::remove_file(journal_path);
+    }
 }

@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): propagated marketCrossBps to all managed Planner sites and preserved reconciled terminal oid.
 use std::{
     fs,
     io::Write,
@@ -32,6 +33,7 @@ use crate::{
 pub struct ManagedExecutor {
     state: Arc<RwLock<TradingState>>,
     inner: Arc<dyn PlanExecutor>,
+    market_cross_bps: u32,
     transition_lock: Mutex<()>,
     chases: Mutex<Vec<ActiveChase>>,
     entry_protections: Mutex<Vec<EntryProtection>>,
@@ -127,13 +129,32 @@ struct ManagedSnapshot {
     entry_protections: Vec<EntryProtection>,
 }
 
+const DEFAULT_MARKET_CROSS_BPS: u32 = 50;
+
 impl ManagedExecutor {
     pub fn spawn(
         state: Arc<RwLock<TradingState>>,
         inner: Arc<dyn PlanExecutor>,
         interval: Duration,
     ) -> Arc<Self> {
-        Self::start(state, inner, interval, None, ManagedSnapshot::empty(), None)
+        Self::spawn_with_market_cross_bps(state, inner, interval, DEFAULT_MARKET_CROSS_BPS)
+    }
+
+    pub fn spawn_with_market_cross_bps(
+        state: Arc<RwLock<TradingState>>,
+        inner: Arc<dyn PlanExecutor>,
+        interval: Duration,
+        market_cross_bps: u32,
+    ) -> Arc<Self> {
+        Self::start(
+            state,
+            inner,
+            market_cross_bps,
+            interval,
+            None,
+            ManagedSnapshot::empty(),
+            None,
+        )
     }
 
     pub async fn spawn_persisted(
@@ -143,12 +164,22 @@ impl ManagedExecutor {
         path: PathBuf,
         execution: ExecutionControl,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::spawn_persisted_with_scopes(state, inner, interval, path, execution, None).await
+        Self::spawn_persisted_with_scopes(
+            state,
+            inner,
+            DEFAULT_MARKET_CROSS_BPS,
+            interval,
+            path,
+            execution,
+            None,
+        )
+        .await
     }
 
     pub async fn spawn_persisted_with_scopes(
         state: Arc<RwLock<TradingState>>,
         inner: Arc<dyn PlanExecutor>,
+        market_cross_bps: u32,
         interval: Duration,
         path: PathBuf,
         execution: ExecutionControl,
@@ -171,6 +202,7 @@ impl ManagedExecutor {
         Ok(Self::start(
             state,
             inner,
+            market_cross_bps,
             interval,
             Some(ManagedPersistence { path, execution }),
             snapshot,
@@ -181,6 +213,7 @@ impl ManagedExecutor {
     fn start(
         state: Arc<RwLock<TradingState>>,
         inner: Arc<dyn PlanExecutor>,
+        market_cross_bps: u32,
         interval: Duration,
         persistence: Option<ManagedPersistence>,
         snapshot: ManagedSnapshot,
@@ -189,6 +222,7 @@ impl ManagedExecutor {
         let executor = Arc::new(Self {
             state,
             inner,
+            market_cross_bps,
             transition_lock: Mutex::new(()),
             chases: Mutex::new(snapshot.chases),
             entry_protections: Mutex::new(snapshot.entry_protections),
@@ -315,8 +349,11 @@ impl ManagedExecutor {
             require_flat_protected_entry(&state, symbol)?;
             let mut validation_trade = trade.clone();
             validation_trade.trailing = None;
-            let validated =
-                Planner::default().plan_for(&state, symbol, Command::Trade(validation_trade))?;
+            let validated = Planner::with_market_cross_bps(self.market_cross_bps).plan_for(
+                &state,
+                symbol,
+                Command::Trade(validation_trade),
+            )?;
             let Action::Order(validated) = validated.action else {
                 return Err("protected trade did not produce an order batch".to_string());
             };
@@ -337,7 +374,11 @@ impl ManagedExecutor {
                 tif: trade.tif.clone(),
                 post_only: trade.post_only,
             };
-            let plan = Planner::default().plan_for(&state, symbol, Command::Trade(entry))?;
+            let plan = Planner::with_market_cross_bps(self.market_cross_bps).plan_for(
+                &state,
+                symbol,
+                Command::Trade(entry),
+            )?;
             (trade, plan)
         };
         let protection = trade_entry_protection(symbol, &trade, &plan)?;
@@ -376,7 +417,11 @@ impl ManagedExecutor {
                 tif: scale.tif.clone(),
                 post_only: scale.post_only,
             };
-            let plan = Planner::default().plan_for(&state, symbol, Command::Scale(entry))?;
+            let plan = Planner::with_market_cross_bps(self.market_cross_bps).plan_for(
+                &state,
+                symbol,
+                Command::Scale(entry),
+            )?;
             (scale, plan)
         };
         let protection = scale_entry_protection(symbol, &scale, &plan)?;
@@ -431,7 +476,11 @@ impl ManagedExecutor {
         let is_buy = chase.side == CommandSide::Buy;
         let (plan, cloid) = {
             let state = self.state.read().await;
-            let plan = Planner::default().plan_for(&state, symbol, Command::ChasePlace(chase))?;
+            let plan = Planner::with_market_cross_bps(self.market_cross_bps).plan_for(
+                &state,
+                symbol,
+                Command::ChasePlace(chase),
+            )?;
             let Action::Order(batch) = &plan.action else {
                 return Err("chase plan did not produce an order".to_string());
             };
@@ -978,7 +1027,7 @@ impl ManagedExecutor {
         };
         let mut plan = {
             let state = self.state.read().await;
-            Planner::default().plan_for(
+            Planner::with_market_cross_bps(self.market_cross_bps).plan_for(
                 &state,
                 &protection.symbol,
                 Command::ProtectionSet(Protection {
@@ -1219,7 +1268,7 @@ impl ManagedExecutor {
         size: Decimal,
     ) -> Result<(ActionPlan, Cloid), String> {
         let state = self.state.read().await;
-        let plan = Planner::default().plan_for(
+        let plan = Planner::with_market_cross_bps(self.market_cross_bps).plan_for(
             &state,
             symbol,
             Command::ProtectionSet(Protection {
@@ -1663,7 +1712,13 @@ impl EntryProtection {
                     })?;
                     entry.terminal = true;
                 }
-                OrderStatus::Error { .. } | OrderStatus::AlreadyTerminal { .. } => {
+                OrderStatus::AlreadyTerminal { message } => {
+                    if let Some(oid) = crate::core::extract_terminal_oid(message) {
+                        entry.oid = Some(oid);
+                    }
+                    entry.terminal = true;
+                }
+                OrderStatus::Error { .. } => {
                     entry.terminal = true;
                 }
                 OrderStatus::WaitingForFill | OrderStatus::WaitingForTrigger => {}

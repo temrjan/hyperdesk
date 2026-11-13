@@ -16,10 +16,16 @@ pub struct Config {
     pub network: Network,
     pub default_symbol: String,
     pub allowed_symbols: BTreeSet<String>,
+    #[serde(default = "default_include_hip3")]
+    pub include_hip3: bool,
     pub symbol_aliases: BTreeMap<String, String>,
     pub vault_address: Option<String>,
     pub required_account_mode: Option<String>,
     pub market_cross_bps: u32,
+}
+
+fn default_include_hip3() -> bool {
+    true
 }
 
 impl Config {
@@ -44,6 +50,7 @@ impl Config {
             network: Network::Mainnet,
             default_symbol: "BTC".to_string(),
             allowed_symbols: BTreeSet::new(),
+            include_hip3: true,
             symbol_aliases: BTreeMap::new(),
             vault_address: None,
             required_account_mode: None,
@@ -77,6 +84,9 @@ impl Config {
         if let Some(value) = env_value("HL_V2_ALLOWED_SYMBOLS")? {
             self.allowed_symbols = parse_symbol_set(&value)?;
         }
+        if let Some(value) = env_value("HL_V2_INCLUDE_HIP3")? {
+            self.include_hip3 = parse_bool("HL_V2_INCLUDE_HIP3", &value)?;
+        }
         if let Some(value) = env_value("HL_V2_VAULT_ADDRESS")? {
             self.vault_address = Some(non_empty("HL_V2_VAULT_ADDRESS", value)?);
         }
@@ -98,6 +108,19 @@ impl Config {
         for symbol in &self.allowed_symbols {
             canonical_symbol(symbol)?;
         }
+        if !self.include_hip3 {
+            anyhow::ensure!(
+                !self.default_symbol.contains(':'),
+                "defaultSymbol {} is a HIP-3 builder-DEX market and requires includeHip3=true (omit --no-hip3)",
+                self.default_symbol
+            );
+            for symbol in &self.allowed_symbols {
+                anyhow::ensure!(
+                    !symbol.contains(':'),
+                    "allowedSymbols entry {symbol} is a HIP-3 builder-DEX market and requires includeHip3=true (omit --no-hip3)"
+                );
+            }
+        }
         validate_symbol_aliases(&self.allowed_symbols, &self.symbol_aliases)?;
         Ok(())
     }
@@ -117,6 +140,7 @@ struct FileConfig {
     network: Option<Network>,
     default_symbol: Option<String>,
     allowed_symbols: Option<BTreeSet<String>>,
+    include_hip3: Option<bool>,
     symbol_aliases: Option<BTreeMap<String, String>>,
     vault_address: Option<String>,
     required_account_mode: Option<String>,
@@ -136,6 +160,9 @@ impl FileConfig {
                 .into_iter()
                 .map(|symbol| canonical_symbol(&symbol))
                 .collect::<anyhow::Result<_>>()?;
+        }
+        if let Some(value) = self.include_hip3 {
+            cfg.include_hip3 = value;
         }
         if let Some(value) = self.symbol_aliases {
             cfg.symbol_aliases = canonical_alias_map(value)?;
@@ -177,7 +204,6 @@ fn parse_network(raw: &str) -> anyhow::Result<Network> {
     }
 }
 
-#[allow(dead_code)]
 fn parse_bool(name: &str, raw: &str) -> anyhow::Result<bool> {
     match raw.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),

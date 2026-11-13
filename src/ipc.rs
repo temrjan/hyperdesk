@@ -33,6 +33,7 @@ pub enum IpcRequest {
     Health,
     MarketSessionHealth { session_id: u64 },
     Status,
+    MarketSessionStatus { session_id: u64 },
     Orders,
     Position,
     Balances,
@@ -183,6 +184,7 @@ impl IpcApp {
         active: String,
         readiness: crate::state::Readiness,
     ) -> HealthPayload {
+        let untracked_hip3_warning = self.state.read().await.untracked_hip3_warning.clone();
         let execution = self.execution.health().await;
         let action_connected = self
             .action_connection
@@ -190,6 +192,9 @@ impl IpcApp {
             .map(ActionConnectionHealth::connected);
         let state_feed_connected = self.metrics.state_feed_connected();
         let mut reasons = readiness.reasons;
+        if let Some(warning) = untracked_hip3_warning.as_ref() {
+            reasons.push(warning.clone());
+        }
         if let Some(reason) = execution.reason.as_deref() {
             reasons.push(format!("execution halted: {reason}"));
         }
@@ -201,6 +206,7 @@ impl IpcApp {
         }
         HealthPayload {
             ok: readiness.ready
+                && untracked_hip3_warning.is_none()
                 && !execution.halted
                 && action_connected.unwrap_or(true)
                 && state_feed_connected.unwrap_or(true),
@@ -243,6 +249,28 @@ impl IpcApp {
                 let twap_ids = state.active_twaps().map(|(id, _)| *id).collect();
                 let position = state
                     .active_position()
+                    .map(|position| position.value.clone());
+                drop(state);
+                IpcResponse::Status(StatusPayload {
+                    active,
+                    market_count,
+                    open_orders,
+                    twap_ids,
+                    position,
+                })
+            }
+            IpcRequest::MarketSessionStatus { session_id } => {
+                let session = match self.queue.market_session(session_id).await {
+                    Ok(session) => session,
+                    Err(message) => return IpcResponse::Error { message },
+                };
+                let state = self.state.read().await;
+                let active = session.active;
+                let market_count = state.markets.len();
+                let open_orders = state.orders_for(&active).count();
+                let twap_ids = state.twaps_for(&active).map(|(id, _)| *id).collect();
+                let position = state
+                    .position(&active)
                     .map(|position| position.value.clone());
                 drop(state);
                 IpcResponse::Status(StatusPayload {
@@ -566,6 +594,57 @@ async fn handle_connection(
         )
         .await
         .map_err(|_| anyhow::anyhow!("ipc write timeout"))??;
+    }
+}
+
+#[derive(Debug)]
+pub enum SubmitTransportError {
+    BeforeSend(anyhow::Error),
+    AfterSend(anyhow::Error),
+}
+
+pub async fn request_submit(
+    path: &Path,
+    request: &IpcRequest,
+    max_frame_bytes: usize,
+) -> Result<IpcResponse, SubmitTransportError> {
+    let encoded = rmp_serde::to_vec_named(request)
+        .context("encode ipc request")
+        .map_err(SubmitTransportError::BeforeSend)?;
+    if encoded.is_empty() || encoded.len() > max_frame_bytes {
+        return Err(SubmitTransportError::BeforeSend(anyhow::anyhow!(
+            "ipc frame length {} exceeds {max_frame_bytes}",
+            encoded.len()
+        )));
+    }
+    let start = tokio::time::Instant::now();
+    let mut stream = match tokio::time::timeout(REQUEST_TIMEOUT, UnixStream::connect(path)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => return Err(SubmitTransportError::BeforeSend(err.into())),
+        Err(_) => {
+            return Err(SubmitTransportError::BeforeSend(anyhow::anyhow!(
+                "IPC connect timed out after {}ms",
+                REQUEST_TIMEOUT.as_millis()
+            )));
+        }
+    };
+    let remaining = REQUEST_TIMEOUT
+        .saturating_sub(start.elapsed())
+        .max(Duration::from_millis(1));
+    match tokio::time::timeout(remaining, async {
+        write_frame(&mut stream, &encoded, max_frame_bytes).await?;
+        let payload = read_frame(&mut stream, max_frame_bytes).await?;
+        rmp_serde::from_slice::<IpcResponse>(&payload)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+    })
+    .await
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(err)) => Err(SubmitTransportError::AfterSend(err.into())),
+        Err(_) => Err(SubmitTransportError::AfterSend(anyhow::anyhow!(
+            "IPC submit response timed out after {}ms",
+            REQUEST_TIMEOUT.as_millis()
+        ))),
     }
 }
 

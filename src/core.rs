@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): updated apply_filled_position for empty reconciled average_price and preserved reconciled terminal oid.
 use std::{
     future::Future,
     pin::Pin,
@@ -288,9 +289,8 @@ where
                 },
             )
             .await;
-        if receipt.status == ExecutionStatus::Ambiguous
-            && let Some(reconciler) = &self.reconciler
-        {
+        let was_ambiguous = receipt.status == ExecutionStatus::Ambiguous;
+        if was_ambiguous && let Some(reconciler) = &self.reconciler {
             receipt = match reconciler.reconcile(&action).await {
                 Ok(ReconcileOutcome::Applied { detail, statuses }) => self.kernel.reconcile(
                     Reconciliation {
@@ -364,6 +364,10 @@ where
         }
         self.apply_receipt(&plan.market, &action, &receipt, Some(position_baseline))
             .await;
+        if was_ambiguous && receipt.status != ExecutionStatus::Ambiguous {
+            self.record_recovered_order_outcomes(&action, &receipt)
+                .await;
+        }
         if plan.action_label.starts_with("attached_trail:")
             && (receipt.status == ExecutionStatus::Rejected
                 || (receipt.status == ExecutionStatus::Accepted && receipt.error.is_none()))
@@ -716,13 +720,16 @@ where
                         terminal: true,
                     }
                 }
-                OrderStatus::Error { .. } | OrderStatus::AlreadyTerminal { .. } => {
-                    RecoveredOrderOutcome {
-                        oid: None,
-                        filled_size: Decimal::ZERO,
-                        terminal: true,
-                    }
-                }
+                OrderStatus::AlreadyTerminal { message } => RecoveredOrderOutcome {
+                    oid: extract_terminal_oid(message),
+                    filled_size: Decimal::ZERO,
+                    terminal: true,
+                },
+                OrderStatus::Error { .. } => RecoveredOrderOutcome {
+                    oid: None,
+                    filled_size: Decimal::ZERO,
+                    terminal: true,
+                },
                 OrderStatus::WaitingForFill | OrderStatus::WaitingForTrigger => {
                     RecoveredOrderOutcome {
                         oid: None,
@@ -887,6 +894,12 @@ impl PositionBaseline {
     }
 }
 
+pub(crate) fn extract_terminal_oid(message: &str) -> Option<u64> {
+    let rest = message.rsplit_once("(oid=")?.1;
+    let digits = rest.strip_suffix(')')?;
+    digits.parse::<u64>().ok()
+}
+
 fn apply_filled_position(
     state: &mut TradingState,
     market: &str,
@@ -908,11 +921,19 @@ fn apply_filled_position(
         else {
             continue;
         };
-        let (Ok(size), Ok(price)) = (
-            total_size.parse::<Decimal>(),
-            average_price.parse::<Decimal>(),
-        ) else {
+        let Ok(size) = total_size.parse::<Decimal>() else {
             continue;
+        };
+        if size <= Decimal::ZERO {
+            continue;
+        }
+        let parsed_price = if average_price.trim().is_empty() {
+            None
+        } else {
+            let Ok(price) = average_price.parse::<Decimal>() else {
+                continue;
+            };
+            (price > Decimal::ZERO).then_some(price)
         };
         filled = true;
         let next_size = (expected.size + if request.is_buy { size } else { -size }).normalize();
@@ -922,7 +943,7 @@ fn apply_filled_position(
             || (expected.size < Decimal::ZERO) != (next_size < Decimal::ZERO)
             || next_size.abs() > expected.size.abs()
         {
-            Some(price)
+            parsed_price
         } else {
             expected.entry_price
         };

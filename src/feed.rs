@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): added live untracked HIP-3 exposure detection when includeHip3=false.
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
@@ -247,7 +248,7 @@ async fn send_subscription(
     Ok(())
 }
 
-async fn apply_ws_message_for(
+pub async fn apply_ws_message_for(
     state: &Arc<RwLock<TradingState>>,
     text: &str,
     expected_user: Option<&str>,
@@ -426,9 +427,22 @@ async fn apply_all_dexs_clearinghouse_state(
     let snapshots = clearinghouse_states(data)?;
     let mut state = state.write().await;
     let mut candidate = state.clone();
+    if !candidate.include_hip3 {
+        let flagged = crate::info::detect_untracked_hip3_clearinghouse(data)?;
+        for item in flagged
+            .into_iter()
+            .filter(|item| item.has_position_or_margin)
+        {
+            if let Some(warning) = candidate.record_untracked_hip3_warning(&item.dex) {
+                eprintln!("{warning}");
+            }
+        }
+    }
     for (snapshot, dex) in snapshots {
         if dex.trim().is_empty() {
             apply_account(&mut candidate, snapshot, now, now)?;
+        } else if !candidate.include_hip3 {
+            continue;
         }
         apply_positions_for_watched(&mut candidate, snapshot, now, now, Some(dex), watched)?;
     }
@@ -500,13 +514,19 @@ async fn apply_user_fills(state: &Arc<RwLock<TradingState>>, data: &Value) -> an
         .ok_or_else(|| anyhow::anyhow!("userFills missing fills"))?;
     let snapshot = state.read().await;
     let mut parsed = Vec::with_capacity(fills.len());
+    let mut untracked_dexes = BTreeSet::new();
     for fill in fills {
-        let symbol = canonical_symbol_for_coin(
-            &snapshot,
-            fill.get("coin")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("fill missing coin"))?,
-        );
+        let raw_coin = fill
+            .get("coin")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("fill missing coin"))?;
+        if !snapshot.include_hip3
+            && let Some((dex, _)) = raw_coin.split_once(':')
+            && !dex.trim().is_empty()
+        {
+            untracked_dexes.insert(dex.trim().to_string());
+        }
+        let symbol = canonical_symbol_for_coin(&snapshot, raw_coin);
         let time_ms = fill
             .get("time")
             .and_then(value_u64)
@@ -536,6 +556,11 @@ async fn apply_user_fills(state: &Arc<RwLock<TradingState>>, data: &Value) -> an
     }
     drop(snapshot);
     let mut state = state.write().await;
+    for dex in untracked_dexes {
+        if let Some(warning) = state.record_untracked_hip3_warning(&dex) {
+            eprintln!("{warning}");
+        }
+    }
     for fill in parsed {
         state.record_fill(fill);
     }

@@ -10,13 +10,15 @@ use std::{
 use clap::Parser;
 use hl_v2::{
     config::Config,
-    ipc::{self, IpcRequest, IpcResponse},
+    execution::ExecutionStatus,
+    ipc::{self, IpcRequest, IpcResponse, SubmitTransportError},
     runtime::{CommandExecutionState, CommandResponse},
     state::Fill,
 };
 use rustix::termios::{
     LocalModes, OptionalActions, SpecialCodeIndex, Termios, tcgetattr, tcsetattr,
 };
+use serde_json::{Value, json};
 
 #[derive(Debug, Parser)]
 #[command(name = "hl", about = "Hyperliquid v2 thin client")]
@@ -27,6 +29,10 @@ struct Args {
     ipc_path: Option<PathBuf>,
     #[arg(long, value_name = "SYMBOL")]
     market: Option<String>,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, default_value_t = 30_000, env = "HL_V2_WAIT_MS")]
+    wait_ms: u64,
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
 }
@@ -34,12 +40,16 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.json {
+        let code = run_json(args).await;
+        std::process::exit(code);
+    }
     let cfg = Config::load(args.data_dir)?;
     let ipc_path = args
         .ipc_path
         .unwrap_or_else(|| cfg.runtime_dir().join("backend.sock"));
     let session_id = match args.market {
-        Some(market) => Some(open_market_session(&ipc_path, market).await?),
+        Some(market) => Some(open_market_session(&ipc_path, market).await?.0),
         None => None,
     };
     let result = if args.command.is_empty() {
@@ -56,9 +66,9 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn open_market_session(path: &Path, market: String) -> anyhow::Result<u64> {
+async fn open_market_session(path: &Path, market: String) -> anyhow::Result<(u64, String)> {
     match ipc::request(path, &IpcRequest::MarketSessionOpen { market }, max_frame()).await? {
-        IpcResponse::MarketSession(session) => Ok(session.session_id),
+        IpcResponse::MarketSession(session) => Ok((session.session_id, session.active)),
         IpcResponse::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected market session response: {other:?}"),
     }
@@ -75,6 +85,458 @@ async fn close_market_session(path: &Path, session_id: u64) -> anyhow::Result<()
         IpcResponse::MarketSessionClosed => Ok(()),
         IpcResponse::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected market session close response: {other:?}"),
+    }
+}
+
+fn emit_json(value: &Value) {
+    let text = serde_json::to_string(value).unwrap_or_else(|err| {
+        format!(
+            r#"{{"ok":false,"type":"error","submitted":false,"outcomeUnknown":false,"retrySafe":true,"commandId":null,"error":"serialize json: {}","payload":null}}"#,
+            err
+        )
+    });
+    println!("{text}");
+}
+
+fn emit_pre_submit_error(message: &str) -> i32 {
+    emit_json(&json!({
+        "ok": false,
+        "type": "error",
+        "submitted": false,
+        "outcomeUnknown": false,
+        "retrySafe": true,
+        "commandId": Value::Null,
+        "error": message,
+        "payload": Value::Null,
+    }));
+    1
+}
+
+fn emit_outcome_unknown_after_submit(command_id: u64, cause: &str) -> i32 {
+    emit_json(&json!({
+        "ok": false,
+        "type": "command_outcome_unknown",
+        "submitted": true,
+        "outcomeUnknown": true,
+        "retrySafe": false,
+        "commandId": command_id,
+        "error": format!(
+            "command {command_id} accepted by hld; outcome unknown ({cause}) — do not resubmit; check with: hl --json command get {command_id}"
+        ),
+        "payload": Value::Null,
+    }));
+    2
+}
+
+async fn run_json(args: Args) -> i32 {
+    if args.command.is_empty() {
+        return emit_pre_submit_error("hl --json requires a command");
+    }
+    let cfg = match Config::load(args.data_dir) {
+        Ok(cfg) => cfg,
+        Err(err) => return emit_pre_submit_error(&err.to_string()),
+    };
+    let ipc_path = args
+        .ipc_path
+        .unwrap_or_else(|| cfg.runtime_dir().join("backend.sock"));
+    let session = match args.market {
+        Some(market) => match open_market_session(&ipc_path, market).await {
+            Ok(session) => Some(session),
+            Err(err) => return emit_pre_submit_error(&err.to_string()),
+        },
+        None => None,
+    };
+    let session_id = session.as_ref().map(|(id, _)| *id);
+    let session_market = session.as_ref().map(|(_, symbol)| symbol.as_str());
+    let code = run_json_command(
+        &ipc_path,
+        &args.command,
+        args.wait_ms,
+        session_id,
+        session_market,
+    )
+    .await;
+    if let Some(session_id) = session_id {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(250),
+            close_market_session(&ipc_path, session_id),
+        )
+        .await;
+    }
+    code
+}
+
+async fn run_json_command(
+    path: &Path,
+    words: &[String],
+    wait_ms: u64,
+    session_id: Option<u64>,
+    session_market: Option<&str>,
+) -> i32 {
+    let first = words
+        .first()
+        .map(|word| word.to_ascii_lowercase())
+        .unwrap_or_default();
+    match first.as_str() {
+        "health" => {
+            if words.len() != 1 {
+                return emit_pre_submit_error("health does not accept arguments");
+            }
+            let request = session_id.map_or(IpcRequest::Health, |session_id| {
+                IpcRequest::MarketSessionHealth { session_id }
+            });
+            match ipc::request(path, &request, max_frame()).await {
+                Ok(IpcResponse::Health(payload)) => {
+                    if payload.ok {
+                        emit_json(&json!({
+                            "ok": true,
+                            "type": "health",
+                            "payload": payload,
+                        }));
+                        0
+                    } else {
+                        let error = if payload.reasons.is_empty() {
+                            payload
+                                .halt_reason
+                                .clone()
+                                .unwrap_or_else(|| "daemon unhealthy".to_string())
+                        } else {
+                            payload.reasons.join("; ")
+                        };
+                        emit_json(&json!({
+                            "ok": false,
+                            "type": "health",
+                            "submitted": false,
+                            "outcomeUnknown": false,
+                            "retrySafe": true,
+                            "commandId": Value::Null,
+                            "error": error,
+                            "payload": payload,
+                        }));
+                        1
+                    }
+                }
+                Ok(IpcResponse::Error { message }) => emit_pre_submit_error(&message),
+                Ok(other) => {
+                    emit_pre_submit_error(&format!("unexpected health response: {other:?}"))
+                }
+                Err(err) => emit_pre_submit_error(&err.to_string()),
+            }
+        }
+        "status" | "st" => {
+            if words.len() != 1 {
+                return emit_pre_submit_error("status does not accept arguments");
+            }
+            let request = session_id.map_or(IpcRequest::Status, |session_id| {
+                IpcRequest::MarketSessionStatus { session_id }
+            });
+            match ipc::request(path, &request, max_frame()).await {
+                Ok(IpcResponse::Status(payload)) => {
+                    emit_json(&json!({
+                        "ok": true,
+                        "type": "status",
+                        "payload": payload,
+                    }));
+                    0
+                }
+                Ok(IpcResponse::Error { message }) => emit_pre_submit_error(&message),
+                Ok(other) => {
+                    emit_pre_submit_error(&format!("unexpected status response: {other:?}"))
+                }
+                Err(err) => emit_pre_submit_error(&err.to_string()),
+            }
+        }
+        "orders" => {
+            if words.len() != 1 {
+                return emit_pre_submit_error("orders does not accept arguments");
+            }
+            match ipc::request(path, &IpcRequest::Orders, max_frame()).await {
+                Ok(IpcResponse::Orders(mut payload)) => {
+                    if let Some(symbol) = session_market {
+                        payload.orders.retain(|order| order.symbol == symbol);
+                    }
+                    emit_json(&json!({
+                        "ok": true,
+                        "type": "orders",
+                        "payload": payload,
+                    }));
+                    0
+                }
+                Ok(IpcResponse::Error { message }) => emit_pre_submit_error(&message),
+                Ok(other) => {
+                    emit_pre_submit_error(&format!("unexpected orders response: {other:?}"))
+                }
+                Err(err) => emit_pre_submit_error(&err.to_string()),
+            }
+        }
+        "position" | "positions" | "pos" => {
+            if words.len() != 1 {
+                return emit_pre_submit_error("position does not accept arguments");
+            }
+            match ipc::request(path, &IpcRequest::Position, max_frame()).await {
+                Ok(IpcResponse::Position(mut payload)) => {
+                    if let Some(symbol) = session_market {
+                        payload
+                            .positions
+                            .retain(|position| position.symbol == symbol);
+                    }
+                    emit_json(&json!({
+                        "ok": true,
+                        "type": "position",
+                        "payload": payload,
+                    }));
+                    0
+                }
+                Ok(IpcResponse::Error { message }) => emit_pre_submit_error(&message),
+                Ok(other) => {
+                    emit_pre_submit_error(&format!("unexpected position response: {other:?}"))
+                }
+                Err(err) => emit_pre_submit_error(&err.to_string()),
+            }
+        }
+        "balances" | "portfolio" => {
+            if words.len() != 1 {
+                return emit_pre_submit_error("balances does not accept arguments");
+            }
+            match ipc::request(path, &IpcRequest::Balances, max_frame()).await {
+                Ok(IpcResponse::Balances(payload)) => {
+                    emit_json(&json!({
+                        "ok": true,
+                        "type": "balances",
+                        "payload": payload,
+                    }));
+                    0
+                }
+                Ok(IpcResponse::Error { message }) => emit_pre_submit_error(&message),
+                Ok(other) => {
+                    emit_pre_submit_error(&format!("unexpected balances response: {other:?}"))
+                }
+                Err(err) => emit_pre_submit_error(&err.to_string()),
+            }
+        }
+        "markets" if words.len() == 1 => {
+            match ipc::request(path, &IpcRequest::Markets, max_frame()).await {
+                Ok(IpcResponse::Markets(payload)) => {
+                    emit_json(&json!({
+                        "ok": true,
+                        "type": "markets",
+                        "payload": payload,
+                    }));
+                    0
+                }
+                Ok(IpcResponse::Error { message }) => emit_pre_submit_error(&message),
+                Ok(other) => {
+                    emit_pre_submit_error(&format!("unexpected markets response: {other:?}"))
+                }
+                Err(err) => emit_pre_submit_error(&err.to_string()),
+            }
+        }
+        "fills" => {
+            if words.len() != 1 {
+                return emit_pre_submit_error("fills does not accept arguments");
+            }
+            let request = session_id.map_or(IpcRequest::Fills { after_seq: 0 }, |session_id| {
+                IpcRequest::FillsScoped {
+                    session_id,
+                    after_seq: 0,
+                }
+            });
+            match ipc::request(path, &request, max_frame()).await {
+                Ok(IpcResponse::Fills(payload)) => {
+                    emit_json(&json!({
+                        "ok": true,
+                        "type": "fills",
+                        "payload": payload,
+                    }));
+                    0
+                }
+                Ok(IpcResponse::Error { message }) => emit_pre_submit_error(&message),
+                Ok(other) => {
+                    emit_pre_submit_error(&format!("unexpected fills response: {other:?}"))
+                }
+                Err(err) => emit_pre_submit_error(&err.to_string()),
+            }
+        }
+        "metrics" => {
+            if words.len() != 1 {
+                return emit_pre_submit_error("metrics does not accept arguments");
+            }
+            match ipc::request(path, &IpcRequest::Metrics, max_frame()).await {
+                Ok(IpcResponse::Metrics(payload)) => {
+                    emit_json(&json!({
+                        "ok": true,
+                        "type": "metrics",
+                        "payload": payload,
+                    }));
+                    0
+                }
+                Ok(IpcResponse::Error { message }) => emit_pre_submit_error(&message),
+                Ok(other) => {
+                    emit_pre_submit_error(&format!("unexpected metrics response: {other:?}"))
+                }
+                Err(err) => emit_pre_submit_error(&err.to_string()),
+            }
+        }
+        "command" => {
+            if words.len() != 3 || !words[1].eq_ignore_ascii_case("get") {
+                return emit_pre_submit_error("command supports exactly: command get <id>");
+            }
+            let Ok(command_id) = words[2].parse::<u64>() else {
+                return emit_pre_submit_error("command id must be an unsigned integer");
+            };
+            match ipc::request(path, &IpcRequest::CommandGet { command_id }, max_frame()).await {
+                Ok(IpcResponse::CommandGet(record)) => {
+                    emit_json(&json!({
+                        "ok": true,
+                        "type": "command_get",
+                        "payload": record,
+                    }));
+                    0
+                }
+                Ok(IpcResponse::Error { message }) => emit_pre_submit_error(&message),
+                Ok(other) => {
+                    emit_pre_submit_error(&format!("unexpected command get response: {other:?}"))
+                }
+                Err(err) => emit_pre_submit_error(&err.to_string()),
+            }
+        }
+        "exec" => {
+            if words.len() <= 1 {
+                return emit_pre_submit_error("exec requires a command");
+            }
+            submit_json_command(path, &words[1..].join(" "), wait_ms, session_id).await
+        }
+        _ => submit_json_command(path, &words.join(" "), wait_ms, session_id).await,
+    }
+}
+
+async fn submit_json_command(
+    path: &Path,
+    command: &str,
+    wait_ms: u64,
+    session_id: Option<u64>,
+) -> i32 {
+    let request = match session_id {
+        Some(session_id) => IpcRequest::CommandSubmitScoped {
+            session_id,
+            command: command.to_string(),
+        },
+        None => IpcRequest::CommandSubmit {
+            command: command.to_string(),
+        },
+    };
+    let command_id = match ipc::request_submit(path, &request, max_frame()).await {
+        Ok(IpcResponse::CommandSubmit(payload)) => payload.command_id,
+        Ok(IpcResponse::Error { message }) => return emit_pre_submit_error(&message),
+        Ok(other) => {
+            return emit_pre_submit_error(&format!(
+                "unexpected command submit response: {other:?}"
+            ));
+        }
+        Err(SubmitTransportError::BeforeSend(err)) => {
+            return emit_pre_submit_error(&err.to_string());
+        }
+        Err(SubmitTransportError::AfterSend(err)) => {
+            emit_json(&json!({
+                "ok": false,
+                "type": "command_outcome_unknown",
+                "submitted": Value::Null,
+                "outcomeUnknown": true,
+                "retrySafe": false,
+                "commandId": Value::Null,
+                "error": format!(
+                    "command submission written to hld socket, but response failed ({err}) — do not resubmit; inspect hl --json orders and hl --json position"
+                ),
+                "payload": Value::Null,
+            }));
+            return 2;
+        }
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+    loop {
+        match ipc::request(path, &IpcRequest::CommandGet { command_id }, max_frame()).await {
+            Ok(IpcResponse::CommandGet(record)) => {
+                if record.state == CommandExecutionState::Completed {
+                    let Some(output) = record.response.clone() else {
+                        return emit_outcome_unknown_after_submit(
+                            command_id,
+                            "completed command missing response",
+                        );
+                    };
+                    let has_ambiguous = output
+                        .receipts
+                        .iter()
+                        .any(|receipt| receipt.status == ExecutionStatus::Ambiguous);
+                    if has_ambiguous {
+                        let summary = output.lines.join("; ");
+                        let error = if summary.is_empty() {
+                            format!(
+                                "command {command_id} completed with ambiguous exchange outcome — do not resubmit; check with: hl --json command get {command_id}"
+                            )
+                        } else {
+                            format!(
+                                "{summary} — do not resubmit; check with: hl --json command get {command_id}"
+                            )
+                        };
+                        emit_json(&json!({
+                            "ok": false,
+                            "type": "command_execution",
+                            "submitted": true,
+                            "outcomeUnknown": true,
+                            "retrySafe": false,
+                            "commandId": command_id,
+                            "error": error,
+                            "payload": record,
+                        }));
+                        return 2;
+                    }
+                    if !output.ok {
+                        let error = if output.lines.is_empty() {
+                            "command failed".to_string()
+                        } else {
+                            output.lines.join("; ")
+                        };
+                        emit_json(&json!({
+                            "ok": false,
+                            "type": "command_execution",
+                            "submitted": true,
+                            "outcomeUnknown": false,
+                            "retrySafe": false,
+                            "commandId": command_id,
+                            "error": error,
+                            "payload": record,
+                        }));
+                        return 1;
+                    }
+                    emit_json(&json!({
+                        "ok": true,
+                        "type": "command_execution",
+                        "payload": record,
+                    }));
+                    return 0;
+                }
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return emit_outcome_unknown_after_submit(
+                        command_id,
+                        &format!("wait timeout after {wait_ms}ms"),
+                    );
+                }
+                tokio::time::sleep((deadline - now).min(Duration::from_millis(50))).await;
+            }
+            Ok(IpcResponse::Error { message }) => {
+                return emit_outcome_unknown_after_submit(command_id, &message);
+            }
+            Ok(other) => {
+                return emit_outcome_unknown_after_submit(
+                    command_id,
+                    &format!("unexpected command get response: {other:?}"),
+                );
+            }
+            Err(err) => {
+                return emit_outcome_unknown_after_submit(command_id, &err.to_string());
+            }
+        }
     }
 }
 

@@ -28,6 +28,8 @@ pub struct InfoClient {
     http: reqwest::Client,
     network: Network,
     metrics: Metrics,
+    info_url_override: Option<Arc<str>>,
+    ws_url_override: Option<Arc<str>>,
 }
 
 pub struct InfoReconciler {
@@ -86,9 +88,36 @@ impl InfoReconciler {
                     .to_string(),
             });
         }
+        let filled_oids: BTreeSet<u64> = authoritative
+            .iter()
+            .filter_map(|item| match item {
+                AuthoritativeOrder::Order {
+                    status,
+                    oid,
+                    orig_sz,
+                    remaining_sz,
+                    ..
+                } if filled_quantity_for_order(status, *orig_sz, *remaining_sz).is_some() => {
+                    Some(*oid)
+                }
+                _ => None,
+            })
+            .collect();
+        let vwaps = if filled_oids.is_empty() {
+            BTreeMap::new()
+        } else {
+            match self
+                .client
+                .post(json!({ "type": "userFills", "user": self.user }))
+                .await
+            {
+                Ok(value) => compute_fill_vwaps(&value, &filled_oids),
+                Err(_) => BTreeMap::new(),
+            }
+        };
         let statuses = authoritative
             .into_iter()
-            .map(authoritative_order_status)
+            .map(|order| authoritative_order_status(order, &vwaps))
             .collect();
         Ok(ReconcileOutcome::Applied {
             detail: "reconciled order action by cloid".to_string(),
@@ -269,13 +298,15 @@ impl ActionReconciler for InfoReconciler {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum AuthoritativeOrder {
     Unknown,
     Order {
         status: String,
         oid: u64,
         cloid: Option<String>,
+        orig_sz: Decimal,
+        remaining_sz: Decimal,
     },
 }
 
@@ -303,28 +334,117 @@ fn parse_authoritative_order(value: &Value) -> Result<AuthoritativeOrder, String
                     .get("cloid")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
+                orig_sz: decimal_field(order, &["origSz"])
+                    .map_err(|err| format!("orderStatus invalid origSz: {err}"))?,
+                remaining_sz: decimal_field(order, &["sz"])
+                    .map_err(|err| format!("orderStatus invalid sz: {err}"))?,
             })
         }
         other => Err(format!("unexpected orderStatus response status {other:?}")),
     }
 }
 
-fn authoritative_order_status(status: AuthoritativeOrder) -> OrderStatus {
+fn is_canceled_order_status(status: &str) -> bool {
+    status == "canceled" || status == "scheduledCancel" || status.ends_with("Canceled")
+}
+
+fn filled_quantity_for_order(
+    status: &str,
+    orig_sz: Decimal,
+    remaining_sz: Decimal,
+) -> Option<Decimal> {
+    let filled_sz = (orig_sz - remaining_sz).max(Decimal::ZERO);
+    if status == "filled" {
+        let qty = if filled_sz > Decimal::ZERO {
+            filled_sz
+        } else {
+            orig_sz.max(Decimal::ZERO)
+        };
+        (qty > Decimal::ZERO).then_some(qty)
+    } else if filled_sz > Decimal::ZERO
+        && (is_canceled_order_status(status) || status == "triggered")
+    {
+        Some(filled_sz)
+    } else {
+        None
+    }
+}
+
+fn compute_fill_vwaps(value: &Value, target_oids: &BTreeSet<u64>) -> BTreeMap<u64, Decimal> {
+    let Some(rows) = value.as_array() else {
+        return BTreeMap::new();
+    };
+    let mut accum: BTreeMap<u64, (Decimal, Decimal)> = BTreeMap::new();
+    for row in rows {
+        let Some(oid) = row.get("oid").and_then(Value::as_u64) else {
+            continue;
+        };
+        if !target_oids.contains(&oid) {
+            continue;
+        }
+        let (Ok(px), Ok(sz)) = (decimal_field(row, &["px"]), decimal_field(row, &["sz"])) else {
+            continue;
+        };
+        if px <= Decimal::ZERO || sz <= Decimal::ZERO {
+            continue;
+        }
+        let entry = accum.entry(oid).or_insert((Decimal::ZERO, Decimal::ZERO));
+        entry.0 += px * sz;
+        entry.1 += sz;
+    }
+    accum
+        .into_iter()
+        .filter(|&(_, (_, total_sz))| total_sz > Decimal::ZERO)
+        .map(|(oid, (notional, total_sz))| (oid, (notional / total_sz).normalize()))
+        .collect()
+}
+
+fn authoritative_order_status(
+    status: AuthoritativeOrder,
+    vwaps: &BTreeMap<u64, Decimal>,
+) -> OrderStatus {
     match status {
         AuthoritativeOrder::Unknown => OrderStatus::Error {
             message: "order cloid remained unknown during partial reconciliation".to_string(),
         },
-        AuthoritativeOrder::Order { status, oid, cloid } if status == "open" => {
-            OrderStatus::Resting { oid, cloid }
+        AuthoritativeOrder::Order {
+            status,
+            oid,
+            cloid,
+            orig_sz,
+            remaining_sz,
+        } => {
+            if status == "open" {
+                return OrderStatus::Resting { oid, cloid };
+            }
+            if let Some(filled_qty) = filled_quantity_for_order(&status, orig_sz, remaining_sz) {
+                let average_price = vwaps
+                    .get(&oid)
+                    .map(|px| px.normalize().to_string())
+                    .unwrap_or_default();
+                return OrderStatus::Filled {
+                    oid,
+                    total_size: filled_qty.normalize().to_string(),
+                    average_price,
+                };
+            }
+            if status == "triggered" {
+                if remaining_sz > Decimal::ZERO {
+                    return OrderStatus::Resting { oid, cloid };
+                }
+                return OrderStatus::AlreadyTerminal {
+                    message: format!("authoritative order status is {status} (oid={oid})"),
+                };
+            }
+            if is_canceled_order_status(&status) {
+                return OrderStatus::AlreadyTerminal {
+                    message: format!("authoritative order status is {status} (oid={oid})"),
+                };
+            }
+            OrderStatus::Error {
+                message: format!("authoritative order status is {status}"),
+            }
         }
-        AuthoritativeOrder::Order { status, .. }
-            if matches!(status.as_str(), "filled" | "canceled" | "triggered") =>
-        {
-            OrderStatus::Success
-        }
-        AuthoritativeOrder::Order { status, .. } => OrderStatus::Error {
-            message: format!("authoritative order status is {status}"),
-        },
     }
 }
 
@@ -345,6 +465,8 @@ impl InfoClient {
             http: build_http_client(),
             network,
             metrics: Metrics::default(),
+            info_url_override: None,
+            ws_url_override: None,
         }
     }
 
@@ -353,7 +475,19 @@ impl InfoClient {
             http: build_http_client(),
             network,
             metrics,
+            info_url_override: None,
+            ws_url_override: None,
         }
+    }
+
+    pub fn with_info_url(mut self, url: impl Into<Arc<str>>) -> Self {
+        self.info_url_override = Some(url.into());
+        self
+    }
+
+    pub fn with_ws_url(mut self, url: impl Into<Arc<str>>) -> Self {
+        self.ws_url_override = Some(url.into());
+        self
     }
 
     pub async fn seed_state(
@@ -362,10 +496,22 @@ impl InfoClient {
         allowed_symbols: &BTreeSet<String>,
         user: Option<&str>,
     ) -> anyhow::Result<TradingState> {
+        self.seed_state_with_options(default_symbol, allowed_symbols, user, true)
+            .await
+    }
+
+    pub async fn seed_state_with_options(
+        &self,
+        default_symbol: &str,
+        allowed_symbols: &BTreeSet<String>,
+        user: Option<&str>,
+        include_hip3: bool,
+    ) -> anyhow::Result<TradingState> {
         let default_symbol = default_symbol.to_ascii_uppercase();
         let mut state = TradingState::new(default_symbol.clone());
+        state.include_hip3 = include_hip3;
         state.fill_session_start_ms = now_ms();
-        let (markets, spot_price_wires) = self.markets(allowed_symbols).await?;
+        let (markets, spot_price_wires) = self.markets(allowed_symbols, include_hip3).await?;
         state.spot_price_wires = spot_price_wires;
         for market in markets {
             state.set_market(market);
@@ -520,10 +666,12 @@ impl InfoClient {
     async fn markets(
         &self,
         allowed_symbols: &BTreeSet<String>,
+        include_hip3: bool,
     ) -> anyhow::Result<(Vec<Market>, BTreeMap<u64, String>)> {
         let dex_value = self.post(json!({"type":"perpDexs"})).await?;
         let metas = self.post(json!({"type":"allPerpMetas"})).await?;
-        let mut markets = parse_all_perp_metas(&dex_value, &metas, allowed_symbols)?;
+        let mut markets =
+            parse_all_perp_metas_with_options(&dex_value, &metas, allowed_symbols, include_hip3)?;
         let spots = parse_spot_markets(&self.post(json!({"type":"spotMetaAndAssetCtxs"})).await?)?;
         let (spot_markets, spot_price_wires) = select_spot_markets(spots, allowed_symbols);
         markets.extend(spot_markets);
@@ -616,8 +764,51 @@ impl InfoClient {
             .map(|market| market.dex.clone().unwrap_or_default())
             .collect();
         let request_ms = now_ms();
-        let snapshots = crate::info_reads::order_snapshots(self.network, user, dexes).await?;
-        for (dex, orders) in snapshots {
+        let startup = crate::info_reads::startup_ws_snapshots_at(
+            self.ws_url(),
+            user,
+            dexes,
+            !state.include_hip3,
+        )
+        .await?;
+        if !state.include_hip3 {
+            let all_dexs = startup.all_dexs_clearinghouse.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing allDexsClearinghouseState snapshot required for --no-hip3 validation"
+                )
+            })?;
+            let flagged = detect_untracked_hip3_clearinghouse(all_dexs)?;
+            let immediate: Vec<&str> = flagged
+                .iter()
+                .filter(|item| item.has_position_or_margin)
+                .map(|item| item.dex.as_str())
+                .collect();
+            if !immediate.is_empty() {
+                anyhow::bail!(
+                    "refusing --no-hip3 (includeHip3=false): account has active HIP-3 position or margin usage on non-root DEX(es): {}; restart without --no-hip3",
+                    immediate.join(", ")
+                );
+            }
+            for item in flagged
+                .iter()
+                .filter(|item| item.has_positive_account_value)
+            {
+                let open = self
+                    .post(user_scoped("frontendOpenOrders", user, Some(&item.dex)))
+                    .await?;
+                let orders = open.as_array().ok_or_else(|| {
+                    anyhow::anyhow!("frontendOpenOrders for dex {} must be array", item.dex)
+                })?;
+                if !orders.is_empty() {
+                    anyhow::bail!(
+                        "refusing --no-hip3 (includeHip3=false): account has {} open order(s) on non-root HIP-3 DEX {}; restart without --no-hip3",
+                        orders.len(),
+                        item.dex
+                    );
+                }
+            }
+        }
+        for (dex, orders) in startup.orders_by_dex {
             let dex = (!dex.is_empty()).then_some(dex.as_str());
             let symbols = symbols_in_dex(state, dex);
             let refs = symbols.iter().map(String::as_str).collect::<Vec<_>>();
@@ -645,11 +836,21 @@ impl InfoClient {
         .await
     }
 
-    fn info_url(&self) -> &'static str {
+    fn info_url(&self) -> &str {
+        if let Some(url) = &self.info_url_override {
+            return url;
+        }
         match self.network {
             Network::Mainnet => "https://api.hyperliquid.xyz/info",
             Network::Testnet => "https://api.hyperliquid-testnet.xyz/info",
         }
+    }
+
+    fn ws_url(&self) -> &str {
+        if let Some(url) = &self.ws_url_override {
+            return url;
+        }
+        self.network.ws_url()
     }
 }
 
@@ -844,10 +1045,95 @@ struct SpotMarket {
     quote: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrackedHip3Dex {
+    pub dex: String,
+    pub has_position_or_margin: bool,
+    pub has_positive_account_value: bool,
+}
+
+pub fn detect_untracked_hip3_clearinghouse(
+    all_dexs_data: &Value,
+) -> anyhow::Result<Vec<UntrackedHip3Dex>> {
+    let entries = all_dexs_data
+        .get("clearinghouseStates")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("allDexsClearinghouseState missing clearinghouseStates"))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let parts = entry
+            .as_array()
+            .filter(|parts| parts.len() == 2)
+            .ok_or_else(|| {
+                anyhow::anyhow!("allDexsClearinghouseState entry must be [dex, state]")
+            })?;
+        let dex = parts[0]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("allDexsClearinghouseState tuple dex invalid"))?
+            .trim();
+        let snapshot = &parts[1];
+        anyhow::ensure!(
+            snapshot.is_object(),
+            "allDexsClearinghouseState state invalid"
+        );
+        if dex.is_empty() {
+            continue;
+        }
+        let rows = snapshot
+            .get("assetPositions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("clearinghouseState missing assetPositions"))?;
+        let mut has_position = false;
+        for row in rows {
+            let position = row
+                .get("position")
+                .ok_or_else(|| anyhow::anyhow!("asset position missing position"))?;
+            let size = decimal_field(position, &["szi", "size"])?;
+            if !size.is_zero() {
+                has_position = true;
+                break;
+            }
+        }
+        let summary = snapshot
+            .get("marginSummary")
+            .or_else(|| snapshot.get("crossMarginSummary"));
+        let total_margin_used = match summary {
+            Some(summary) => optional_decimal(summary, "totalMarginUsed")?.unwrap_or(Decimal::ZERO),
+            None => Decimal::ZERO,
+        };
+        let account_value = match summary {
+            Some(summary) => optional_decimal(summary, "accountValue")?
+                .or(optional_decimal(summary, "totalRawUsd")?)
+                .unwrap_or(Decimal::ZERO),
+            None => Decimal::ZERO,
+        };
+        let has_position_or_margin = has_position || total_margin_used > Decimal::ZERO;
+        let has_positive_account_value = account_value > Decimal::ZERO;
+        if has_position_or_margin || has_positive_account_value {
+            out.push(UntrackedHip3Dex {
+                dex: dex.to_string(),
+                has_position_or_margin,
+                has_positive_account_value,
+            });
+        }
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
 fn parse_all_perp_metas(
     dex_value: &Value,
     metas: &Value,
     allowed: &BTreeSet<String>,
+) -> anyhow::Result<Vec<Market>> {
+    parse_all_perp_metas_with_options(dex_value, metas, allowed, true)
+}
+
+fn parse_all_perp_metas_with_options(
+    dex_value: &Value,
+    metas: &Value,
+    allowed: &BTreeSet<String>,
+    include_hip3: bool,
 ) -> anyhow::Result<Vec<Market>> {
     let rows = metas
         .as_array()
@@ -860,6 +1146,9 @@ fn parse_all_perp_metas(
         "perpDexs/allPerpMetas index mismatch; reconnect to rediscover"
     );
     let mut markets = parse_markets(&json!([rows[0]]), allowed, None)?;
+    if !include_hip3 {
+        return Ok(markets);
+    }
     for dex in parse_perp_dexs(dex_value, &BTreeSet::new())? {
         let meta = &rows[dex.index as usize];
         let universe = meta
