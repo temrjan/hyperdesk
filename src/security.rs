@@ -1,5 +1,6 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): redacted Credentials Debug, enforced KDF floors, added 0600 password-file reader, and added signer collision guard.
 use std::{
-    fs,
+    fmt, fs,
     io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -10,16 +11,31 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
+use alloy_primitives::Address;
+use alloy_signer_local::PrivateKeySigner;
 use argon2::Argon2;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
+pub const MIN_KDF_MEM_KIB: u32 = 19_456;
+pub const MIN_KDF_ITERS: u32 = 2;
+
+#[derive(Clone, Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 pub struct Credentials {
     pub main_wallet: String,
     pub api_private_key: String,
     pub network: String,
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("main_wallet", &self.main_wallet)
+            .field("api_private_key", &"[REDACTED]")
+            .field("network", &self.network)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +107,76 @@ pub fn credentials_exist(data_dir: &Path, profile: &str) -> anyhow::Result<bool>
         "incomplete credential files for wallet profile {profile}"
     );
     Ok(cred_exists)
+}
+
+pub fn validate_agent_signer(
+    signer_addr: Address,
+    main_wallet: &str,
+    vault_address: Option<&str>,
+) -> anyhow::Result<()> {
+    let main_addr: Address = main_wallet
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid main wallet address"))?;
+    anyhow::ensure!(
+        signer_addr != main_addr,
+        "refusing Master Wallet private key: API signer address {signer_addr} matches main_wallet {main_addr}; create a delegated Hyperliquid Agent Wallet instead"
+    );
+    if let Some(vault_raw) = vault_address {
+        let vault_addr: Address = vault_raw
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid vault address"))?;
+        anyhow::ensure!(
+            signer_addr != vault_addr,
+            "refusing Vault private key: API signer address {signer_addr} matches vaultAddress {vault_addr}; create a delegated Hyperliquid Agent Wallet instead"
+        );
+    }
+    Ok(())
+}
+
+pub fn store_validated_credentials(
+    data_dir: &Path,
+    profile: &str,
+    password: &[u8],
+    credentials: &Credentials,
+    vault_address: Option<&str>,
+) -> anyhow::Result<()> {
+    let signer: PrivateKeySigner = credentials
+        .api_private_key
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid API private key"))?;
+    validate_agent_signer(signer.address(), &credentials.main_wallet, vault_address)?;
+    store_credentials(data_dir, profile, password, credentials)
+}
+
+pub fn read_password_file(path: &Path) -> anyhow::Result<Zeroizing<String>> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| anyhow::anyhow!("inspect password file {}: {err}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "password file {} must be a regular file (not a symlink, directory, or FIFO)",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = metadata.mode() & 0o777;
+        anyhow::ensure!(
+            mode & 0o077 == 0,
+            "password file {} has insecure permissions {:04o}; expected 0600 (no group/other access)",
+            path.display(),
+            mode
+        );
+    }
+    let mut raw = Zeroizing::new(
+        fs::read_to_string(path)
+            .map_err(|err| anyhow::anyhow!("read password file {}: {err}", path.display()))?,
+    );
+    let trimmed_len = raw.trim_end_matches(['\r', '\n']).len();
+    raw.truncate(trimmed_len);
+    Ok(raw)
 }
 
 pub fn store_credentials(
@@ -186,27 +272,48 @@ fn profile_credential_paths(data_dir: &Path, profile: &str) -> (PathBuf, PathBuf
     )
 }
 
+pub fn resolve_kdf_params(
+    mem_kib_env: Option<&str>,
+    iters_env: Option<&str>,
+) -> anyhow::Result<argon2::Params> {
+    let mem_kib = parse_kdf_param("HL_KDF_MEM_KiB", mem_kib_env, MIN_KDF_MEM_KIB)?;
+    let iters = parse_kdf_param("HL_KDF_ITERS", iters_env, MIN_KDF_ITERS)?;
+    argon2::Params::new(mem_kib, iters, 1, Some(32))
+        .map_err(|err| anyhow::anyhow!("invalid Argon2 KDF parameters: {err}"))
+}
+
 fn derive_key(password: &[u8], salt: &[u8]) -> anyhow::Result<[u8; 32]> {
-    let mem_kib = kdf_parameter("HL_KDF_MEM_KiB", 19_456)?;
-    let iters = kdf_parameter("HL_KDF_ITERS", 2)?;
-    let params = argon2::Params::new(mem_kib, iters, 1, Some(32))?;
+    let mem_env = env_kdf_var("HL_KDF_MEM_KiB")?;
+    let iters_env = env_kdf_var("HL_KDF_ITERS")?;
+    let params = resolve_kdf_params(mem_env.as_deref(), iters_env.as_deref())?;
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut out = [0_u8; 32];
     argon2.hash_password_into(password, salt, &mut out)?;
     Ok(out)
 }
 
-fn kdf_parameter(name: &str, default: u32) -> anyhow::Result<u32> {
+fn env_kdf_var(name: &str) -> anyhow::Result<Option<String>> {
     match std::env::var(name) {
-        Ok(value) => value
-            .parse::<u32>()
-            .map_err(|_| anyhow::anyhow!("{name} must be a positive integer"))
-            .and_then(|value| {
-                anyhow::ensure!(value > 0, "{name} must be positive");
-                Ok(value)
-            }),
-        Err(std::env::VarError::NotPresent) => Ok(default),
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(err) => Err(anyhow::anyhow!("read {name}: {err}")),
+    }
+}
+
+fn parse_kdf_param(name: &str, raw: Option<&str>, min_value: u32) -> anyhow::Result<u32> {
+    match raw {
+        None => Ok(min_value),
+        Some(value) => {
+            let parsed = value
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("{name} must be an integer >= {min_value}"))?;
+            anyhow::ensure!(
+                parsed >= min_value,
+                "{name} must be >= {min_value} (got {parsed})"
+            );
+            Ok(parsed)
+        }
     }
 }
 

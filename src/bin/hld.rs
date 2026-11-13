@@ -4,7 +4,6 @@
 use std::{
     io::{BufRead, BufReader, Write},
     path::PathBuf,
-    process::{Command, Stdio},
     sync::Arc,
 };
 
@@ -28,7 +27,7 @@ use hl_v2::{
     state::{AccountMode, TradingState},
 };
 use tokio::sync::RwLock;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 const INFO_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -210,15 +209,27 @@ async fn session(
             security::load_credentials(&cfg.data_dir, Some(&profile), password)
         })?
     } else {
-        let credentials = collect_wallet_credentials(cfg.network, &profile)?;
+        let credentials =
+            collect_wallet_credentials(cfg.network, &profile, cfg.vault_address.as_deref())?;
         with_password(credential_password(args, true)?, |password| {
-            security::store_credentials(&cfg.data_dir, &profile, password, &credentials)
+            security::store_validated_credentials(
+                &cfg.data_dir,
+                &profile,
+                password,
+                &credentials,
+                cfg.vault_address.as_deref(),
+            )
         })?;
         println!("created wallet profile {profile}");
         credentials
     };
     ensure_network(cfg.network, &credentials.network)?;
     let signer: PrivateKeySigner = credentials.api_private_key.parse()?;
+    security::validate_agent_signer(
+        signer.address(),
+        &credentials.main_wallet,
+        cfg.vault_address.as_deref(),
+    )?;
     let journal = ActionJournal::new(cfg.journal_path());
     let user = cfg
         .vault_address
@@ -255,9 +266,9 @@ async fn session(
     })
 }
 
-fn credential_password(args: &Args, create: bool) -> anyhow::Result<String> {
+fn credential_password(args: &Args, create: bool) -> anyhow::Result<Zeroizing<String>> {
     if let Some(path) = args.password_file.as_ref() {
-        let password = std::fs::read_to_string(path)?.trim().to_string();
+        let password = security::read_password_file(path)?;
         anyhow::ensure!(
             !create || !password.is_empty(),
             "credentials password must not be empty"
@@ -267,33 +278,30 @@ fn credential_password(args: &Args, create: bool) -> anyhow::Result<String> {
     if !create {
         return prompt_password("Enter credentials password: ");
     }
-    let mut password = prompt_password("Create credentials password: ")?;
+    let password = prompt_password("Create credentials password: ")?;
     anyhow::ensure!(
         !password.is_empty(),
         "credentials password must not be empty"
     );
-    let mut confirm = prompt_password("Confirm credentials password: ")?;
-    let matches = password == confirm;
-    confirm.zeroize();
-    if !matches {
-        password.zeroize();
-        anyhow::bail!("credentials password confirmation mismatch");
-    }
+    let confirm = prompt_password("Confirm credentials password: ")?;
+    anyhow::ensure!(
+        password == confirm,
+        "credentials password confirmation mismatch"
+    );
     Ok(password)
 }
 
 fn with_password<T>(
-    mut password: String,
+    password: Zeroizing<String>,
     op: impl FnOnce(&[u8]) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let result = op(password.as_bytes());
-    password.zeroize();
-    result
+    op(password.as_bytes())
 }
 
 fn collect_wallet_credentials(
     network: Network,
     profile: &str,
+    vault_address: Option<&str>,
 ) -> anyhow::Result<security::Credentials> {
     eprintln!("setting up wallet profile {profile}");
     let wallet = prompt_line("Main wallet address (0x...): ")?;
@@ -301,13 +309,17 @@ fn collect_wallet_credentials(
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid main wallet address"))?;
     let mut api_private_key = prompt_password("API private key (hex): ")?;
-    if api_private_key.parse::<PrivateKeySigner>().is_err() {
-        api_private_key.zeroize();
-        anyhow::bail!("invalid API private key");
-    }
+    let trimmed_key = Zeroizing::new(api_private_key.trim().to_string());
+    api_private_key.clear();
+    let signer: PrivateKeySigner = trimmed_key
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid API private key"))?;
+    let wallet_str = wallet.to_string();
+    security::validate_agent_signer(signer.address(), &wallet_str, vault_address)?;
+    let mut owned_key = trimmed_key;
     Ok(security::Credentials {
-        main_wallet: wallet.to_string(),
-        api_private_key,
+        main_wallet: wallet_str,
+        api_private_key: std::mem::take(&mut *owned_key),
         network: match network {
             Network::Mainnet => "Mainnet".to_string(),
             Network::Testnet => "Testnet".to_string(),
@@ -325,7 +337,7 @@ fn prompt_line(prompt: &str) -> anyhow::Result<String> {
     Ok(line)
 }
 
-fn prompt_password(prompt: &str) -> anyhow::Result<String> {
+fn prompt_password(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
     #[cfg(not(unix))]
     {
         let _ = prompt;
@@ -343,41 +355,51 @@ fn prompt_password(prompt: &str) -> anyhow::Result<String> {
             })?;
         tty.write_all(prompt.as_bytes())?;
         tty.flush()?;
-        let _guard = EchoGuard::disable(&tty)?;
-        let mut line = String::new();
-        BufReader::new(tty.try_clone()?).read_line(&mut line)?;
-        tty.write_all(b"\n")?;
-        Ok(line.trim_end_matches(&['\r', '\n'][..]).to_string())
+        let guard = EchoGuard::disable(&tty)?;
+        let mut line = Zeroizing::new(String::new());
+        let read_res = BufReader::new(tty.try_clone()?).read_line(&mut line);
+        drop(guard);
+        let _ = tty.write_all(b"\n");
+        read_res?;
+        let trimmed_len = line.trim_end_matches(['\r', '\n']).len();
+        line.truncate(trimmed_len);
+        Ok(line)
     }
 }
 
 #[cfg(unix)]
-struct EchoGuard;
+struct EchoGuard {
+    tty: std::fs::File,
+    saved: rustix::termios::Termios,
+}
 
 #[cfg(unix)]
 impl EchoGuard {
     fn disable(tty: &std::fs::File) -> anyhow::Result<Self> {
-        let status = Command::new("stty")
-            .arg("-echo")
-            .stdin(Stdio::from(tty.try_clone()?))
-            .status()?;
-        anyhow::ensure!(
-            status.success(),
-            "failed to secure password input (echo disabled unavailable)"
-        );
-        Ok(Self)
+        use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+        let guard_tty = tty.try_clone()?;
+        let saved = tcgetattr(&guard_tty)
+            .map_err(|err| anyhow::anyhow!("failed to read TTY state: {err}"))?;
+        let mut no_echo = saved.clone();
+        no_echo.local_modes.remove(LocalModes::ECHO);
+        tcsetattr(&guard_tty, OptionalActions::Now, &no_echo).map_err(|err| {
+            anyhow::anyhow!("failed to secure password input (echo disabled unavailable): {err}")
+        })?;
+        Ok(Self {
+            tty: guard_tty,
+            saved,
+        })
     }
 }
 
 #[cfg(unix)]
 impl Drop for EchoGuard {
     fn drop(&mut self) {
-        if let Ok(tty) = std::fs::OpenOptions::new().read(true).open("/dev/tty") {
-            let _ = Command::new("stty")
-                .arg("echo")
-                .stdin(Stdio::from(tty))
-                .status();
-        }
+        let _ = rustix::termios::tcsetattr(
+            &self.tty,
+            rustix::termios::OptionalActions::Now,
+            &self.saved,
+        );
     }
 }
 

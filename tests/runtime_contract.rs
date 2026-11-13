@@ -300,3 +300,139 @@ async fn account_summary_and_doctor_report_the_authoritative_source_and_causes()
             .any(|line| line.contains("ambiguous action"))
     );
 }
+
+struct GatedExecutor {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl CommandExecutor for GatedExecutor {
+    fn execute_command<'a>(&'a self, _command: Command) -> ExecuteFuture<'a> {
+        Box::pin(async move {
+            self.started.notify_waiters();
+            self.release.notified().await;
+            accepted().await
+        })
+    }
+
+    fn execute_command_for<'a>(&'a self, _symbol: &'a str, _command: Command) -> ExecuteFuture<'a> {
+        Box::pin(async move {
+            self.started.notify_waiters();
+            self.release.notified().await;
+            accepted().await
+        })
+    }
+}
+
+#[tokio::test]
+async fn r09_command_queue_enforces_size_and_depth_bounds_without_leaking_scope_jobs() {
+    use hl_v2::{
+        ipc::{IpcApp, IpcRequest, IpcResponse},
+        runtime::{MAX_COMMAND_BYTES, MAX_TRACKED_SUBMISSIONS},
+    };
+
+    let gate = Arc::new(GatedExecutor {
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let scopes = ScopeRegistry::new("BTC".to_string()).unwrap();
+    let state = Arc::new(RwLock::new(ready_perp("0")));
+    let service = Arc::new(CommandService::new(state.clone(), gate.clone()).with_scopes(scopes));
+    let queue = CommandQueue::new(service).unwrap();
+    let app = IpcApp::new(state, Metrics::default(), queue.clone());
+
+    let session = match app
+        .dispatch(IpcRequest::MarketSessionOpen {
+            market: "BTC".to_string(),
+        })
+        .await
+    {
+        IpcResponse::MarketSession(session) => session,
+        other => panic!("expected MarketSession, got {other:?}"),
+    };
+
+    // Oversized commands (> 64 KiB) fail on both global and scoped submit without leaking jobs.
+    let oversized = format!("buy {}", "1".repeat(MAX_COMMAND_BYTES));
+    assert!(matches!(
+        app.dispatch(IpcRequest::CommandSubmit {
+            command: oversized.clone(),
+        })
+        .await,
+        IpcResponse::Error { .. }
+    ));
+    assert!(matches!(
+        app.dispatch(IpcRequest::CommandSubmitScoped {
+            session_id: session.session_id,
+            command: oversized,
+        })
+        .await,
+        IpcResponse::Error { .. }
+    ));
+
+    // Fill queue to exact MAX_TRACKED_SUBMISSIONS (1 running + 255 queued).
+    let first_waiter = gate.started.notified();
+    let first_id = match app
+        .dispatch(IpcRequest::CommandSubmitScoped {
+            session_id: session.session_id,
+            command: "buy 0.01".to_string(),
+        })
+        .await
+    {
+        IpcResponse::CommandSubmit(resp) => resp.command_id,
+        other => panic!("expected first CommandSubmit, got {other:?}"),
+    };
+    first_waiter.await;
+
+    let mut last_id = first_id;
+    for _ in 1..MAX_TRACKED_SUBMISSIONS {
+        last_id = match app
+            .dispatch(IpcRequest::CommandSubmitScoped {
+                session_id: session.session_id,
+                command: "status".to_string(),
+            })
+            .await
+        {
+            IpcResponse::CommandSubmit(resp) => resp.command_id,
+            other => panic!("expected queued CommandSubmit, got {other:?}"),
+        };
+    }
+
+    // 257th submission is rejected on both scoped and unscoped paths and releases scope retain count.
+    assert!(matches!(
+        app.dispatch(IpcRequest::CommandSubmitScoped {
+            session_id: session.session_id,
+            command: "status".to_string(),
+        })
+        .await,
+        IpcResponse::Error { .. }
+    ));
+    assert!(matches!(
+        app.dispatch(IpcRequest::CommandSubmit {
+            command: "status".to_string(),
+        })
+        .await,
+        IpcResponse::Error { .. }
+    ));
+
+    // Release running job and let remaining queued commands complete, then close scoped session cleanly.
+    gate.release.notify_one();
+    for _ in 0..200 {
+        if let Some(record) = queue.get(last_id).await
+            && record.state == CommandExecutionState::Completed
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        queue.get(last_id).await.unwrap().state,
+        CommandExecutionState::Completed
+    );
+    assert_eq!(
+        app.dispatch(IpcRequest::MarketSessionClose {
+            session_id: session.session_id,
+        })
+        .await,
+        IpcResponse::MarketSessionClosed
+    );
+}

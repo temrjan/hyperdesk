@@ -1437,6 +1437,9 @@ pub struct CommandPendingResponse {
     pub confirmations: Vec<PendingConfirmationView>,
 }
 
+pub const MAX_COMMAND_BYTES: usize = 65_536;
+pub const MAX_TRACKED_SUBMISSIONS: u32 = 256;
+
 pub struct CommandQueue {
     instance_id: String,
     service: Arc<CommandService>,
@@ -1475,7 +1478,7 @@ impl CommandQueue {
         &self.instance_id
     }
 
-    pub async fn submit(&self, command: String) -> CommandSubmitResponse {
+    pub async fn submit(&self, command: String) -> Result<CommandSubmitResponse, String> {
         self.enqueue(command, None).await
     }
 
@@ -1484,21 +1487,44 @@ impl CommandQueue {
         session_id: u64,
         command: String,
     ) -> Result<CommandSubmitResponse, String> {
+        if command.len() > MAX_COMMAND_BYTES {
+            return Err(format!(
+                "command exceeds maximum length of {MAX_COMMAND_BYTES} bytes"
+            ));
+        }
         let scopes = self
             .service
             .scopes
             .as_ref()
             .ok_or_else(|| "market sessions unavailable".to_string())?;
         scopes.retain_job(session_id).await?;
-        Ok(self.enqueue(command, Some(session_id)).await)
+        match self.enqueue(command, Some(session_id)).await {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                scopes.release_job(session_id).await;
+                Err(err)
+            }
+        }
     }
 
-    async fn enqueue(&self, command: String, session_id: Option<u64>) -> CommandSubmitResponse {
+    async fn enqueue(
+        &self,
+        command: String,
+        session_id: Option<u64>,
+    ) -> Result<CommandSubmitResponse, String> {
+        if command.len() > MAX_COMMAND_BYTES {
+            return Err(format!(
+                "command exceeds maximum length of {MAX_COMMAND_BYTES} bytes"
+            ));
+        }
         let mut state = self.state.lock().await;
+        if queue_depth(&state) >= MAX_TRACKED_SUBMISSIONS {
+            return Err("execution queue full".to_string());
+        }
         let response = Self::insert(&mut state, command, session_id, None);
         drop(state);
         self.notify.notify_one();
-        response
+        Ok(response)
     }
 
     fn insert(
@@ -1545,8 +1571,8 @@ impl CommandQueue {
         market: &str,
         command: String,
     ) -> Result<CommandSubmitResponse, String> {
-        if command.is_empty() || command.len() > 65_536 {
-            return Err("command must contain 1..65536 bytes".to_string());
+        if command.is_empty() || command.len() > MAX_COMMAND_BYTES {
+            return Err(format!("command must contain 1..{MAX_COMMAND_BYTES} bytes"));
         }
         let scopes = self
             .service
@@ -1575,7 +1601,7 @@ impl CommandQueue {
                 running_command_id: state.running,
             });
         }
-        if queue_depth(&state) >= 256 {
+        if queue_depth(&state) >= MAX_TRACKED_SUBMISSIONS {
             return Err("execution queue full".to_string());
         }
         scopes

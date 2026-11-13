@@ -76,7 +76,7 @@ fn run_hl(data_dir: &Path, socket: &Path, args: &[&str]) -> std::process::Output
 async fn real_client_enforces_arity_health_exit_and_typed_quit() {
     let dir = temp_dir();
     std::fs::create_dir_all(&dir).unwrap();
-    let socket = dir.join("backend.sock");
+    let socket = dir.join("runtime").join("backend.sock");
     let state = Arc::new(RwLock::new(ready_perp("0")));
     let metrics = Metrics::default();
     let service = Arc::new(
@@ -160,7 +160,7 @@ async fn real_client_enforces_arity_health_exit_and_typed_quit() {
 async fn interactive_shell_restores_the_exact_prior_terminal_state() {
     let dir = temp_dir();
     std::fs::create_dir_all(&dir).unwrap();
-    let socket = dir.join("backend.sock");
+    let socket = dir.join("runtime").join("backend.sock");
     let state = Arc::new(RwLock::new(ready_perp("0")));
     let service = Arc::new(CommandService::new(state.clone(), Arc::new(NoopExecutor)));
     let app = IpcApp::new(

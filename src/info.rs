@@ -1,3 +1,4 @@
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): added InfoClient HTTP timeouts, authoritative orderStatus + userFills VWAP reconciliation, and includeHip3 startup guard.
 use std::{
     collections::{BTreeMap, BTreeSet},
     str::FromStr,
@@ -327,10 +328,21 @@ fn authoritative_order_status(status: AuthoritativeOrder) -> OrderStatus {
     }
 }
 
+const INFO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const INFO_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(INFO_CONNECT_TIMEOUT)
+        .timeout(INFO_REQUEST_TIMEOUT)
+        .build()
+        .expect("valid InfoClient reqwest configuration")
+}
+
 impl InfoClient {
     pub fn new(network: Network) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http_client(),
             network,
             metrics: Metrics::default(),
         }
@@ -338,7 +350,7 @@ impl InfoClient {
 
     pub fn with_metrics(network: Network, metrics: Metrics) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http_client(),
             network,
             metrics,
         }
@@ -2188,5 +2200,38 @@ mod contract_tests {
             assert_eq!(position.local_ms, 200);
             assert_eq!(position.exchange_ms, Some(190));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r11_info_client_enforces_http_request_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/info", listener.local_addr().unwrap());
+        let accept_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+
+        for client in [
+            InfoClient::new(Network::Testnet),
+            InfoClient::with_metrics(Network::Testnet, Metrics::default()),
+        ] {
+            let start = tokio::time::Instant::now();
+            let err = client
+                .http
+                .post(&url)
+                .json(&json!({"type": "meta"}))
+                .send()
+                .await
+                .expect_err("non-responding endpoint must time out");
+            assert!(err.is_timeout(), "expected timeout error, got: {err}");
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed >= Duration::from_secs(15) && elapsed < Duration::from_secs(16),
+                "expected 15s request timeout bound, elapsed={elapsed:?}"
+            );
+        }
+        accept_task.abort();
     }
 }

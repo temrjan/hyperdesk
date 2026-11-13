@@ -342,9 +342,10 @@ impl IpcApp {
             IpcRequest::Metrics => IpcResponse::Metrics(MetricsPayload {
                 counters: self.metrics.snapshot(),
             }),
-            IpcRequest::CommandSubmit { command } => {
-                IpcResponse::CommandSubmit(self.queue.submit(command).await)
-            }
+            IpcRequest::CommandSubmit { command } => match self.queue.submit(command).await {
+                Ok(response) => IpcResponse::CommandSubmit(response),
+                Err(message) => IpcResponse::Error { message },
+            },
             IpcRequest::CommandSubmitScoped {
                 session_id,
                 command,
@@ -366,13 +367,70 @@ impl IpcApp {
     }
 }
 
+pub fn current_euid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+pub fn check_peer_uid(peer_uid: u32, expected_uid: u32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        peer_uid == expected_uid,
+        "unauthorized IPC peer uid {peer_uid} (expected {expected_uid})"
+    );
+    Ok(())
+}
+
 pub async fn serve(path: &Path, app: IpcApp, max_frame_bytes: usize) -> anyhow::Result<()> {
     let listener = bind(path).await?;
     serve_bound(listener, app, max_frame_bytes).await
 }
 
 pub async fn bind(path: &Path) -> anyhow::Result<UnixListener> {
-    if let Some(parent) = path.parent() {
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        if !parent.exists() {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder
+                .create(parent)
+                .with_context(|| format!("create IPC parent directory {}", parent.display()))?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("chmod 0700 IPC parent directory {}", parent.display()))?;
+        }
+        let parent_meta = std::fs::symlink_metadata(parent)
+            .with_context(|| format!("inspect IPC parent directory {}", parent.display()))?;
+        anyhow::ensure!(
+            !parent_meta.file_type().is_symlink(),
+            "IPC socket parent directory {} must not be a symlink",
+            parent.display()
+        );
+        anyhow::ensure!(
+            parent_meta.is_dir(),
+            "IPC socket parent {} is not a directory",
+            parent.display()
+        );
+        let expected_uid = current_euid();
+        anyhow::ensure!(
+            parent_meta.uid() == expected_uid,
+            "IPC socket parent directory {} is owned by uid {} (expected {})",
+            parent.display(),
+            parent_meta.uid(),
+            expected_uid
+        );
+        let mode = parent_meta.permissions().mode() & 0o777;
+        anyhow::ensure!(
+            mode & 0o077 == 0,
+            "IPC socket parent directory {} has insecure permissions {:04o}; expected 0700",
+            parent.display(),
+            mode
+        );
+    }
+    #[cfg(not(unix))]
+    {
         tokio::fs::create_dir_all(parent).await?;
     }
     match tokio::fs::symlink_metadata(path).await {
@@ -421,6 +479,21 @@ pub async fn serve_bound(
 ) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
+        #[cfg(unix)]
+        {
+            let expected_uid = current_euid();
+            let peer_uid = match stream.peer_cred() {
+                Ok(cred) => cred.uid(),
+                Err(err) => {
+                    eprintln!("ipc peer_cred error: {err:#}");
+                    continue;
+                }
+            };
+            if let Err(err) = check_peer_uid(peer_uid, expected_uid) {
+                eprintln!("ipc peer rejected: {err:#}");
+                continue;
+            }
+        }
         let app = app.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(stream, app, max_frame_bytes.max(1024)).await {
