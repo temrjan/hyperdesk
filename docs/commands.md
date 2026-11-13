@@ -1,27 +1,51 @@
+<!-- Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed keybinds, @variables, and command chains, and documented deterministic hl --json mode. -->
 # Commands
 
-The daemon owns one typed command grammar for shells, one-shot calls, market sessions, bindings,
-and chains. `help all` is the exhaustive version-matched catalogue; use `help <command>` for details.
-Examples are syntax illustrations, not order recommendations.
+The daemon owns one typed command grammar for interactive shells, one-shot CLI calls, `hl --json`
+agent invocations, and market-scoped sessions. `help all` is the exhaustive version-matched
+catalogue; use `help <command>` for details. Examples are syntax illustrations, not order
+recommendations.
 
 ## Client forms
 
 ```bash
-hl                           # interactive shell
-hl status                    # one-shot command
-hl exec buy '20$' at 40000    # explicit one-shot form
-hl --market BTC              # independent market-scoped shell
-hl --market BTC orders
-hl health                    # JSON health, nonzero exit if unhealthy
-hl metrics
-hl command get 42            # retained command result
-hl press k                   # execute a persisted single-character binding
+hl                                      # interactive shell (rustix::termios raw mode on TTY)
+hl status                               # one-shot human-readable command
+hl exec buy '20$' at 40000              # explicit one-shot form
+hl --market BTC                         # independent market-scoped shell
+hl --market BTC orders                  # market-scoped one-shot read
+hl health                               # JSON health, nonzero exit if unhealthy
+hl metrics                              # daemon counters
+hl command get 42                       # retained command result
+hl --json health                        # single-object JSON envelope (exit 0 / 1 / 2)
+hl --market ETH --json status           # market-scoped JSON read
+hl --wait-ms 15000 --json buy 0.01      # duplicate-safe JSON execution with bounded wait
 ```
 
-In an external shell, quote tokens containing `$` and entire chains to prevent shell expansion.
-Inside the interactive `hl` shell, use them literally. Without `--market`, `orders`/`position`
-are account-wide and `instrument` changes the default market. With it, reads and trading use that
-session's market. Portfolio and balances remain account-wide. Spot inventory appears in balances.
+In an external shell, quote tokens containing `$` (such as `'20$'` or `'$entry-100'`) to prevent
+shell variable expansion. Inside the interactive `hl` shell, enter them literally. Without
+`--market`, `orders` and `position` are account-wide and `instrument` changes the global default
+market. With `--market <SYMBOL>`, reads and trading target that session's market without mutating
+global `state.active`. Portfolio and balances remain account-wide; spot inventory appears in
+balances.
+
+## Deterministic JSON mode (`hl --json`)
+
+Pass `--json` (with optional `--wait-ms <u64>`, default `30000`, env `HL_V2_WAIT_MS`) for scripts
+and AI agents. Every `hl --json <command...>` call writes **exactly one** `\n`-terminated JSON
+object to `stdout` (zero ANSI escape codes or plain-text prefixes) and exits with a strict code:
+
+| Exit code | Meaning | Agent / automation rule |
+| --- | --- | --- |
+| `0` | `"ok": true` — read query succeeded (and daemon is healthy for `health`), or queued command completed with zero `ambiguous` receipts | Safe completion |
+| `1` | `"ok": false`, `"outcomeUnknown": false` — pre-enqueue validation/connect error (`"submitted": false, "retrySafe": true`), unhealthy `health`, or deterministic command rejection (`"submitted": true, "retrySafe": false`) | Inspect `"error"` before deciding |
+| `2` | `"ok": false`, `"outcomeUnknown": true`, `"retrySafe": false` — command was accepted by (or written to) `hld`, then polling timed out (`--wait-ms`), socket closed, or exchange receipt was `ambiguous` | **MUST NOT blindly resubmit**; inspect `hl --json command get <commandId>`, `hl --json orders`, and `hl --json position` |
+
+Structured read queries routed directly without queue mutation: `health`, `status` (`st`), `orders`,
+`position` (`positions`/`pos`), `balances` (`portfolio`), `markets` (no filter args), `fills`,
+`metrics`, and `command get <id>`. When `--market <SYMBOL>` is supplied, `health`, `status`,
+`orders`, `position`, and `fills` are scoped to `<SYMBOL>`. All other commands submit via
+`CommandSubmit` / `CommandSubmitScoped` and poll `CommandGet` every `50ms` up to `--wait-ms`.
 
 ## Families
 
@@ -35,16 +59,18 @@ session's market. Portfolio and balances remain account-wide. Spot inventory app
 | Trade | `buy`/`b`, `sell`/`s`, `scale`, `batch`, `close`, `twap` | Submit entries/exits and exchange TWAPs |
 | Manage | `cancel`/`c`, `move`, `resize`, `tp`, `sl`, `trail`/`tsl`, `chase` | Orders and protection |
 | Account | `leverage`/`lev`, `margin`, `account mode` | Perp margin/leverage and account mode |
-| Shell | `help`/`h`, `set`, `print`, `unset`, `keybinds`/`binds`, `bind`, `unbind` | Help and automation |
-| Shell | `clear`/`cls`, `quit`/`exit`/`q` | Local terminal controls |
+| Shell | `help`/`h`, `clear`/`cls`, `quit`/`exit`/`q` | Help and local terminal controls |
 
 Use `markets all`, `markets perps`, `markets hip3`, or `markets spot`. `config get <key>` inspects
-configuration; `risk` and `config` do not mutate it. `borrow`/`lend` are read views.
+configuration; `risk` and `config` do not mutate it. `borrow`/`lend` are read views. Single-key
+bindings (`bind`/`unbind`/`keybinds`/`press`), `@variables` (`set`/`print`/`unset`), and `;`/`sleep`
+/ `wait` command chains are intentionally absent; invoke `hl` (or `hl --json`) from external scripts
+or agents when sequencing commands.
 
 ## Size and price
 
-Sizes: `0.01` base units, `100$` quote notional, `5%` percentage according to command/account context,
-`r100$` or `r0.5%` risk sizing with an attached stop loss, and `@name` variables.
+Sizes: `0.01` base units, `100$` quote notional, `5%` percentage according to command/account
+context, or `r100$` / `r0.5%` risk sizing with an attached fixed stop loss (`sl`).
 Prices: `40000` absolute, `-100`/`+100` offsets, `-0.5%`/`+0.5%` offsets, or `$entry` when known.
 Signed relative levels resolve from a fresh midpoint; bare percentage prices are rejected.
 Wire precision and exchange minimums apply after rounding. Risk sizing does not guarantee realized
@@ -94,42 +120,21 @@ chase cancel
 Plain `cancel` skips TP/SL/trailing protection; cancel those explicitly. Eligible ordinary limit
 cancellation batches automatically request fast cancel. Mixed batches remain one ordinary action.
 Cancel an existing chase before replacing it. Chase cancellation disarms only protection attached
-to its own entry; independent protected entries retain their protection intent. Attached protection starts from a fresh flat position
-and follows owned entry fills; it requires the daemon to remain running until the entry finishes.
-Local validation rejects an invalid batch before submission, but exchange responses can contain
-per-item failures: always inspect them.
+to its own entry; independent protected entries retain their protection intent. Attached protection
+starts from a fresh flat position and follows owned entry fills; it requires the daemon to remain
+running until the entry finishes. Local validation rejects an invalid batch before submission, but
+exchange responses can contain per-item failures: always inspect them.
 
-`trail`/`tsl` places a native reduce-only position trailing stop. Native trailing requires at least
-10 USDC of notional after rounding, including full-position orders. An absolute retracement is a price
-distance; a percentage must be greater than zero and below 100, with at most four decimal places.
-Optional `activate <price>` defers tracking until Hyperliquid activates the order. Long trails track
-the highest mark; short trails track the lowest mark. `orders` displays activation, retracement,
-and the exchange watermark/current derived trigger, or a waiting state. Quote-denominated sizing
-uses the fresh mark price; percentage sizing uses the current position. There is no local fallback.
-Generic move/resize is rejected: cancel and place a new trail explicitly, which resets its watermark.
-`sl cancel` targets fixed stops; `trail cancel` targets native trails and disarms future attached
-trailing increments. Existing native trails continue while the daemon is offline.
+`trail`/`tsl` places a native reduce-only position trailing stop (`>= 10 USDC` notional after
+rounding). Generic move/resize is rejected: cancel and place a new trail explicitly, which resets
+its watermark. `sl cancel` targets fixed stops; `trail cancel` targets native trails and disarms
+future attached trailing increments. Existing native trails continue while the daemon is offline.
 
-Attached trailing creates a separate native order for each newly protected owned fill increment;
-each has its own watermark. Earlier trails are never resized or recreated. If one tranche ends while an entry is still pending,
-the daemon cancels the remaining entry, retains surviving exits, and requests position reconciliation.
-It does not infer a fill from an order disappearing. Unavailable, stale, or conflicting position state
-also stops an unfinished trailing entry and retains its existing exits. If a later increment is
-below the exchange minimum or protection fails, existing protection remains, the remaining entry
-is canceled, and the daemon reports degraded protection. An unfilled owned entry missing from the order snapshot also triggers cancellation and explicit
-review rather than silently discarding its trailing attachment. Fills can still arrive while cancellation
-is in flight; review the resulting filled position explicitly.
+TWAP duration is `5..10080` minutes and minimum notional is `100 USDC` after precision rounding.
+Active IDs, conditions, and waiting/running state appear in `status`; cancel with
+`twap cancel <id|all>`. Closing a shell does not cancel exchange orders.
 
-TWAP duration is 5..10080 minutes and minimum notional is 100 USDC after precision rounding.
-`trigger above|below <price>` is optional and its direction is independent of buy/sell. A buy TWAP
-accepts optional `max <price>`; a sell TWAP accepts `min <price>`. The stop must be above/below the
-trigger respectively, or above/below the fresh current mark when no trigger is specified. Prices
-must be positive and satisfy market precision. Conditions also work for supported spot markets;
-spot reduce-only remains invalid. Hyperliquid owns activation and stopping. Active IDs, conditions,
-and waiting/running state appear in `status`; cancel with `twap cancel <id|all>`. Unconditional TWAPs
-retain their original wire format. Closing a shell does not cancel exchange orders.
-
-## Account and shell
+## Account controls
 
 ```text
 leverage cross 5
@@ -140,20 +145,8 @@ account mode
 account mode require standard
 account mode require any
 account mode set unified
-
-set @size 0.01
-print @size
-buy @size at -0.2%
-unset @size
-bind k cancel
-keybinds
-unbind k
-buy 0.01 at -0.2%; sleep 2s; orders
 ```
 
 Margin changes require a fresh active isolated perp position. Account-mode changes are account-wide
 and require an expiring typed confirmation; an API wallet can move standard mode to unified or
 portfolio mode, but transitions requiring the main-user signer reject locally.
-Mode requirements and bindings are daemon-wide; scoped variables are session-local.
-Chains stop on failure or pending confirmation; limits are 32 segments, 300 seconds per sleep,
-900 seconds total sleep. Quoted semicolons are not separators.

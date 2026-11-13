@@ -1,127 +1,92 @@
+<!-- Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): updated deterministic/security gates, documented dependency upgrades and RUSTSEC-2026-0387/reqwest-tower paths, and updated Testnet acceptance. -->
 # Validation
 
-## Deterministic gate
+## Deterministic & security gate
 
-Run for every source change:
+Run on `rustc 1.91.1` (`rust-toolchain.toml`) before every commit/handoff:
 
 ```bash
 cargo fmt --all -- --check
-cargo check --locked --all-targets
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
+cargo check --workspace --locked --all-targets
+cargo clippy --workspace --locked --all-targets -- -D warnings
+cargo test --workspace --locked --all-targets
 cargo build --locked --release --bins
+test -z "$(cargo tree --locked --all-targets -i axum 2>/dev/null)"
+! rg -n '\bmod server\b|server::|Command::new\("stty"\)' src/
+cargo tree --locked -e features --target all -i rkyv
+cargo audit --no-fetch -D unsound \
+  --ignore RUSTSEC-2026-0235 \
+  --ignore RUSTSEC-2026-0387
 git diff --check
 ```
 
-The GitHub Actions `CI` workflow runs this gate on Ubuntu for pushes to main, pull requests, and
-manual dispatch. It uses the pinned Rust toolchain and read-only checkout without persisted
-credentials. Tests require no exchange account, running trading backend, or secrets. CI checks
-compilation, behavior at mocked exchange boundaries, local IPC/PTY, and release builds; it cannot
-prove current exchange acceptance or profitability.
+Tests require no exchange account, live network, or secrets. They exercise compilation under
+`#![forbid(unsafe_code)]`, mocked exchange HTTP/WebSocket boundaries, journal-before-post and
+`/info` `orderStatus` + `userFills` VWAP reconciliation, `marketCrossBps` propagation, `--no-hip3`
+startup/live exposure guards, Agent-vs-Master/Vault collision rejection, `0700`/`0600` UDS +
+`peer_cred()` + `64 KiB`/`256` queue limits, Argon2id floors, `5s`/`15s` HTTP timeouts, PTY raw-mode
+restoration, and the `hl --json` (`0`/`1`/`2`) CLI contract.
 
-## Test policy
+## Dependencies and RustSec audit posture
 
-Each test must own a distinct observable contract or reproduced regression. Prefer table-driven
-cases and the lowest useful boundary. Use real serialization, journal, IPC, and binary interfaces
-where those interfaces are the contract. Fake exchange/time boundaries when needed, inspect exact
-submitted actions, and prove rejection side effects where relevant. Remove redundant tests that
-mirror implementation or incidental output. Test count and coverage percentages are not targets.
+Patched crates compiled in `Cargo.lock`:
 
-The suite covers typed grammar and aliases, planner action classes and invariants, journal-before-post,
-ambiguous acknowledgements, dependent protection, cancellation races, restart identity, account-source
-parity, HTTP authorization, encrypted credentials, real client/IPC/PTY behavior, and feed liveness. Identified native-client IPC tests use a real UDS connection to reproduce a lost
-submission reply, concurrent retries, payload conflicts, result eviction, fixed market targeting, and
-typed partial outcomes.
+- TLS & X.509 roots: `rustls 0.23.46`, `rustls-webpki 0.103.17`, `webpki-roots 1.0.12`,
+  `webpki-root-certs 1.0.12` (resolves `RUSTSEC-2026-0346` through `RUSTSEC-2026-0349`).
+- Async runtime & syscalls: `tokio 1.54.1` (`>= 1.53.3`, resolves `RUSTSEC-2026-0386`),
+  `rustix 1.1.6` (`>= 1.1.6`, resolves `RUSTSEC-2026-0486`).
+- Lockfile cleanup: `quinn-proto` upgraded to `0.11.19` (eliminates `RUSTSEC-2026-0338` through
+  `RUSTSEC-2026-0342` from `Cargo.lock` entirely; `cargo tree --locked -e features --target all -i quinn-proto`
+  also confirms it is uncompiled).
+- HTTP server removal: `axum` and direct `tower` dependencies were removed from `Cargo.toml` along
+  with `src/server.rs` (`cargo tree --locked --all-targets -i axum` matches no package). Note that
+  `reqwest 0.13.4` internally depends on `tower 0.5.3` and `tower-http 0.6.11` (`follow-redirect`,
+  `retry`, `timeout`) strictly as outbound HTTP client middleware (`hl-v2 -> reqwest 0.13.4 -> tower-http 0.6.11 -> tower 0.5.3`);
+  zero HTTP server listeners exist in `hld`.
 
-## Dependencies
+Every `--ignore` flag in the `cargo audit` gate is verified and bounded:
 
-Before release, run `cargo machete`, `cargo audit`, and `cargo tree -e features --target all`.
-Review every finding against the compiled feature graph. Lockfile-only optional dependencies can
-appear in audits without entering the binary; demonstrate absence rather than assuming it.
-Do not suppress a vulnerability without documenting its applicability and dependency path.
+1. `RUSTSEC-2026-0235` (`rkyv 0.7.46`, optional dependency of `rust_decimal`): **not compiled** —
+   `cargo tree --locked -e features --target all -i rkyv` prints `warning: nothing to print.`
+2. `RUSTSEC-2026-0387` (`crypto-bigint 0.5.5`, patched only in breaking `>= 0.7.0-rc.15`; `alloy*`
+   `2.1.1`/`1.7.3` on `rustc 1.91.1` remains on the `elliptic-curve 0.13.8` / `k256 0.13.4` /
+   `ecdsa 0.16.9` line): compiled path is
+   `crypto-bigint 0.5.5 -> elliptic-curve 0.13.8 / k256 0.13.4 -> ecdsa 0.16.9 -> alloy-signer 2.1.1 / alloy-signer-local 2.1.1 -> hl-v2 0.1.0`.
+   The advisory affects variable-time / `NonZero::new` behavior in modular inversion / Bernstein-Yang
+   GCD. In `hld`, `k256` runs exclusively in-process for deterministic RFC 6979 secp256k1 ECDSA
+   signing over fixed curve parameters and locally constructed EIP-712 / L1 hashes, never on
+   attacker-chosen moduli or over a network-exposed signing oracle. Upgrade `alloy*` / `k256` once a
+   stable release adopts `crypto-bigint >= 0.7`.
 
-The current lockfile reports `RUSTSEC-2026-0235` for optional `rkyv 0.7.46` through `rust_decimal`.
-`cargo tree --locked -e features --target all -i rkyv` prints no dependency path: that package is
-not compiled with this manifest. The audit also reports five advisories for optional
-`quinn-proto 0.11.15`; `cargo tree --locked -e features --target all -i quinn-proto`
-likewise shows no compiled dependency path. The compiled TLS dependency was updated from `rustls 0.23.40` to patched `0.23.45`
-for `RUSTSEC-2026-0285`, with its compatible webpki/AWS-LC dependencies. The full deterministic
-gate passed after this update. The latest audit reports four newer Rustls advisories
-(RUSTSEC-2026-0346 through RUSTSEC-2026-0349), with 0.23.46 identified as patched;
-these remain an outstanding dependency limitation.
-The lockfile also reports unmaintained `derivative`, `paste`, and
-`proc-macro-error2`, plus yanked `bitcoin-io`/`bitcoin_hashes`. Of these, `paste` and
-`proc-macro-error2` participate in the current Alloy build; the others are optional and absent
-from the compiled graph. Retain the tested dependency set for this release and reassess upstream
-maintenance before updates. The unfiltered audit remains visible and exits nonzero; CI does not
-claim a clean vulnerability audit.
+## Bounded live acceptance (Pre-Mainnet Testnet gate)
 
-## Bounded live acceptance
+Before connecting any funded Mainnet Agent Wallet, execute bounded live acceptance on a dedicated
+**Hyperliquid Testnet** account with tiny sizes and keep operational logs outside the repository:
 
-Live trading requires explicit authorization, an isolated low-value account/API wallet, and a
-fixed exposure budget. Keep operational evidence outside the public repository.
+1. Pass the deterministic & security gate above and build `target/release/{hld,hl}`.
+2. Provision a Testnet account and register a delegated **Agent Wallet** (`approveAgent`). Confirm in
+   a throwaway directory that pasting the Master Wallet address + Master key is rejected by `hld`
+   (`R-07`) without creating `credentials.bin`. Then initialize the real Testnet Agent Wallet profile
+   and confirm `0700` data/runtime directories and `0600` `credentials.bin`, `salt.bin`, and
+   `runtime/backend.sock` (testing both default `includeHip3: true` startup and `--no-hip3` startup).
+3. Verify read & agent JSON envelopes: `hl --json health`, `hl --json balances`,
+   `hl --market BTC --json status`, and `hl --json markets` (`exit 0`, single JSON object on `stdout`).
+4. Exercise resting post-only limit placement, `move`, `resize`, `hl --json orders`, and `cancel`.
+5. Exercise a tiny IOC market trade with custom `marketCrossBps`, then inspect
+   `hl --json command get <commandId>` and `hl --json position`.
+6. Exercise protected entries (`buy <size> sl <px> tp <px>`, a scaled/partial-fill case, and a native
+   `trail` case), restart `hld` while brackets are live on Testnet, unlock, and verify clean
+   `ActionJournal` + `InfoReconciler` + WebSocket convergence without duplicate orders or lost exits.
+7. Exercise `chase` and conditional `twap` start/cancel, `close` any remaining Testnet position, and
+   confirm `hl --json orders` and `hl --json position` are flat with zero unresolved journal rows.
 
-1. Pass the deterministic gate on the exact release tree and build its binaries.
-2. Start read-only; exercise discovery, read commands, HTTP authorization, aliases, and action rejection.
-3. Record independent exchange state, then start one signing daemon on testnet or the authorized account.
-4. Exercise the smallest valid order through placement, acknowledgement, modify, cancel, fill, close,
-   and state convergence. Cover native perp, builder perp, and spot only when permitted/supported.
-5. Cover batch, scale, protection, chase, leverage, isolated margin, and applicable account-mode
-   guards. For native trails, verify activation and mark-price watermark movement, offline continuity,
-   external-interface adoption, separate attached partial-fill tranches, retained surviving exits when
-   one tranche ends, cancel-family isolation,
-   and amendment rejection. For TWAPs, verify waiting-to-running activation, max/min termination,
-   and cancellation in both states; cover spot only when permitted/supported. Confirm fast cancellation
-   is accepted for eligible plain batches and omitted for mixed/protective batches.
-6. Exercise simultaneous scoped clients and `hl-grid`; prove independent scopes and one journal order.
-7. Restart with controlled passive/managed work; prove reconciliation or an explicit halt.
-8. Soak health, feeds, state, orders, TWAPs, and resource use while clients remain active.
-9. End with two independent reconciliations agreeing on intended positions, orders, TWAPs, balances,
-   leverage, and account mode. Resolve every pending journal row.
+### Public read-only discovery acceptance
 
-Do not broaden permission or exposure to make a scenario pass. Record skipped or unproven boundaries.
-Never publish real wallet addresses, credentials, balances, fills, journals, host paths, or private logs.
-
-## Exchange contract references
-
-Contracts were checked against primary sources on 2026-10-05:
-
-- [Exchange endpoint](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint):
-  action encoding, TWAPs, cancellation, and omission of `f` when false.
-- [Trailing stops](https://hyperliquid.gitbook.io/hyperliquid-docs/support/faq/trailing-stops) and
-  [order types](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/order-types): mark-price trailing
-  behavior, activation, and conditional TWAP semantics.
-- [WebSocket subscriptions](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions):
-  order/TWAP state and spot asset context feeds.
-- The official [Hyperliquid frontend](https://app.hyperliquid.xyz/) corroborates signed field order
-  and supplies conditional TWAP encoding and native order-state parsing details not covered by the
-  public API reference. Its inspected config bundle SHA-256 was
-  `190151d92ace708da81dd6262443d479040d0b9f8c81f47a8c2d0aad65ab103a`.
-
-The exchange endpoint reference says fast cancel currently has no additional effect; the
-[latency guide](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/optimizing-latency)
-recommends it. The implementation requests it for eligible batches but makes no measured latency
-claim. Deterministic fixtures prove serialization and local lifecycle contracts; exchange acceptance
-and live execution semantics still require the authorized bounded tests above.
-
-### Discovery acceptance
-
-The deterministic contracts verify aggregate/per-DEX market-field equivalence, retained asset indices
-under filtering, namespace/list mismatch rejection, weighted rolling read budgets, and bounded HTTP
-429 retries with a virtual clock. A local WebSocket server verifies exact subscriptions, out-of-order
-completion, wrong-user rejection, and failure when a DEX snapshot is missing. Snapshot fixtures retain
-large order IDs and native trailing-protection fields without transformation.
-
-Run the optional public read-only acceptance explicitly:
+Run the optional public read-only discovery check explicitly when network access is available:
 
 ```bash
 cargo test --locked --test discovery_live -- --ignored --nocapture
 ```
 
-It initializes the full universe and all DEX order snapshots on mainnet and testnet for the zero
-address; it never signs or submits actions. On 2026-10-19, the implementation initialized 877 markets
-across 10 builder DEXes on mainnet in 3.5 seconds and 2301 markets across 272 builder DEXes on testnet
-in 6.9 seconds. Timings are samples, not guarantees. Separate public reads compared every market
-field consumed by the parser against the old endpoint for all 11 mainnet DEX entries and four
-representative testnet entries (native, first, middle, last). This does not certify live trading or
-nonempty real-account recovery; those semantics remain covered by deterministic order/protection tests.
+It initializes the full market universe and per-DEX `openOrders` snapshots on Mainnet and Testnet for
+the zero address without signing or submitting actions.

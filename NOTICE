@@ -1,3 +1,28 @@
 hlcli
 Copyright 2026 bahmgit
 https://github.com/bahmgit
+
+---
+
+hyperdesk (2026 adaptation of bahmgit/hlcli under Apache License 2.0)
+
+This repository modifies upstream `bahmgit/hlcli` in accordance with Section 4
+of the Apache License, Version 2.0:
+- Removed the embedded HTTP observation server (`src/server.rs`, `axum`, direct
+  `tower` dependency, and `bind`/`allowRemote`/`backendToken` configuration) and
+  enforced strict configuration deserialization (`#[serde(deny_unknown_fields)]`).
+- Removed the keybind, `@variable`, command-chain (`;`/`sleep`/`wait`), and
+  `hl-grid` operator shell layer (`src/operator.rs`), migrated terminal raw-mode
+  and password echo handling from `stty` subprocesses to `rustix::termios`, and
+  enforced `#![forbid(unsafe_code)]` across all library and binary crates.
+- Enabled full native Perp, Spot, and HIP-3 builder-DEX market discovery by
+  default (`includeHip3: true`, `allowedSymbols: []`) with an exposure-safe
+  `--no-hip3` opt-out guard on startup and live WebSocket state.
+- Added a deterministic, duplicate-safe `hl --json` (`--wait-ms`) machine
+  interface with explicit exit codes (`0` / `1` / `2`) and scoped market reads.
+- Hardened `/info` `orderStatus` + `userFills` VWAP reconciliation, propagated
+  `marketCrossBps` across all `ManagedExecutor` planning paths, enforced Agent vs.
+  Master/Vault signer collision checks, hardened Unix domain socket directory/peer
+  UID/queue bounds, enforced Argon2id KDF floors and secret redaction/zeroization,
+  added `InfoClient` HTTP connect/request timeouts, and upgraded dependencies
+  including `Cargo.lock` and `examples/hl-v2.testnet.json`.

@@ -107,6 +107,18 @@ fn config_is_strict_and_remote_bind_requires_both_opt_ins() {
         config.symbol_aliases,
         BTreeMap::from([("X".to_string(), "BTC".to_string())])
     );
+
+    // Shipped testnet example config must deserialize cleanly under strict `deny_unknown_fields`.
+    let shipped_example = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/hl-v2.testnet.json"),
+    )
+    .unwrap();
+    fs::write(dir.join("hl-v2.json"), shipped_example).unwrap();
+    let example_cfg = Config::load(Some(dir.clone())).unwrap();
+    assert_eq!(example_cfg.network, Network::Testnet);
+    assert!(example_cfg.allowed_symbols.is_empty());
+    assert!(example_cfg.include_hip3);
+
     fs::remove_dir_all(dir).unwrap();
 }
 
