@@ -36,6 +36,7 @@ and AI agents. Every `hl --json <command...>` call writes **exactly one** `\n`-t
 object to `stdout` (zero ANSI escape codes or plain-text prefixes) and exits with a strict code.
 Invalid client arguments under `--json` (for example a non-numeric `--wait-ms` or an unknown flag)
 are pre-enqueue errors: `exit 1`, `"submitted": false`, `"retrySafe": true`.
+Exception: `hl --json --help` (or `-h`) prints plain-text help to `stdout` and exits `0`.
 
 | Exit code | Meaning | Agent / automation rule |
 | --- | --- | --- |
