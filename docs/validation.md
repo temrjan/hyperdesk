@@ -37,7 +37,8 @@ Patched crates compiled in `Cargo.lock`:
   `rustix 1.1.6` (`>= 1.1.6`, resolves `RUSTSEC-2026-0486`).
 - Lockfile cleanup: `quinn-proto` upgraded to `0.11.19` (eliminates `RUSTSEC-2026-0338` through
   `RUSTSEC-2026-0342` from `Cargo.lock` entirely; `cargo tree --locked -e features --target all -i quinn-proto`
-  also confirms it is uncompiled).
+  also confirms it is uncompiled). `quinn-udp` upgraded to `0.5.16` (resolves `RUSTSEC-2026-0538`;
+  also uncompiled per `cargo tree --locked -e features --target all -i quinn-udp`).
 - HTTP server removal: `axum` and direct `tower` dependencies were removed from `Cargo.toml` along
   with `src/server.rs` (`cargo tree --locked --all-targets -i axum` matches no package). Note that
   `reqwest 0.13.4` internally depends on `tower 0.5.3` and `tower-http 0.6.11` (`follow-redirect`,
