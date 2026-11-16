@@ -1,4 +1,4 @@
-// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): added R-05 orderStatus + userFills VWAP reconciliation and R-06 marketCrossBps propagation tests.
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): added R-05 orderStatus + userFills VWAP reconciliation, R-06 marketCrossBps propagation, and CR-01 ambiguity-preservation tests.
 mod support;
 
 use std::{
@@ -1065,6 +1065,244 @@ async fn native_rejection_cancels_entry_but_ambiguity_never_sends_a_followup_act
             "only definite rejection can trigger remaining-entry cancellation"
         );
     }
+}
+
+/// CR-01 effect applied to state when a scripted receipt returns, mirroring `Core`.
+#[derive(Clone, Copy)]
+enum ScriptedEffect {
+    /// The action post outlived the position freshness window (15 s post timeout > 10 s limit).
+    StalePosition,
+    /// Record resting orders and filled size from the receipt, as `Core::apply_receipt` does.
+    ApplyReceipt,
+    None,
+}
+
+/// CR-01: replays scripted `Core` receipts in order. `Core` halts after an ambiguous outcome, so
+/// an unscripted action fails like a halted `Core`; every attempted action is still recorded.
+struct ScriptedPlanExecutor {
+    state: Arc<RwLock<TradingState>>,
+    plans: Mutex<Vec<ActionPlan>>,
+    script: Mutex<std::collections::VecDeque<(ScriptedEffect, SubmitReceipt)>>,
+}
+
+impl ScriptedPlanExecutor {
+    fn new(state: Arc<RwLock<TradingState>>, script: Vec<(ScriptedEffect, SubmitReceipt)>) -> Self {
+        Self {
+            state,
+            plans: Mutex::new(Vec::new()),
+            script: Mutex::new(script.into()),
+        }
+    }
+
+    fn action_kinds(&self) -> Vec<&'static str> {
+        self.plans
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|plan| match plan.action {
+                Action::Order(_) => "order",
+                Action::TrailingStop(_) => "trailing",
+                Action::CancelByCloid(_) | Action::Cancel(_) => "cancel",
+                _ => "other",
+            })
+            .collect()
+    }
+}
+
+impl CommandExecutor for ScriptedPlanExecutor {
+    fn execute_command<'a>(&'a self, command: Command) -> ExecuteFuture<'a> {
+        Box::pin(async move {
+            let symbol = self.state.read().await.active.clone();
+            self.execute_command_for(&symbol, command).await
+        })
+    }
+
+    fn execute_command_for<'a>(&'a self, symbol: &'a str, command: Command) -> ExecuteFuture<'a> {
+        Box::pin(async move {
+            let state = self.state.read().await;
+            let plan = Planner::default().plan_for(&state, symbol, command)?;
+            drop(state);
+            self.execute_plan(plan).await
+        })
+    }
+}
+
+impl PlanExecutor for ScriptedPlanExecutor {
+    fn execute_plan<'a>(&'a self, plan: ActionPlan) -> ExecuteFuture<'a> {
+        self.plans.lock().unwrap().push(plan.clone());
+        let next = self.script.lock().unwrap().pop_front();
+        Box::pin(async move {
+            let Some((effect, receipt)) = next else {
+                return Err("execution halted: unresolved ambiguous execution".to_string());
+            };
+            let now = now_ms();
+            let mut state = self.state.write().await;
+            match effect {
+                ScriptedEffect::StalePosition => {
+                    state.positions.get_mut(&plan.market).unwrap().local_ms =
+                        now.saturating_sub(15_000);
+                }
+                ScriptedEffect::ApplyReceipt => {
+                    let Action::Order(batch) = &plan.action else {
+                        panic!("receipt effect requires an order batch");
+                    };
+                    let mut filled = Decimal::ZERO;
+                    for (request, status) in batch.orders.iter().zip(&receipt.statuses) {
+                        match status {
+                            OrderStatus::Resting { oid, .. } => state.apply_resting_receipt(
+                                order_from(&plan.market, *oid, request),
+                                now,
+                                now,
+                            ),
+                            OrderStatus::Filled { total_size, .. } => filled += dec(total_size),
+                            _ => {}
+                        }
+                    }
+                    if filled > Decimal::ZERO {
+                        state.apply_fill_position(
+                            Position {
+                                symbol: plan.market.clone(),
+                                size: filled,
+                                entry_price: Some(dec("50000")),
+                                detail: None,
+                            },
+                            now,
+                            now,
+                        );
+                    }
+                }
+                ScriptedEffect::None => {}
+            }
+            Ok(receipt)
+        })
+    }
+}
+
+#[tokio::test]
+async fn cr01_ambiguity_and_accepted_entries_survive_protection_reconciliation() {
+    let ambiguous = |id: u64, error: &str| SubmitReceipt {
+        id,
+        status: ExecutionStatus::Ambiguous,
+        statuses: Vec::new(),
+        error: Some(error.to_string()),
+    };
+    let scale_entry = SubmitReceipt {
+        id: 1,
+        status: ExecutionStatus::Accepted,
+        statuses: vec![
+            OrderStatus::Filled {
+                oid: 101,
+                total_size: "0.01".to_string(),
+                average_price: "50000".to_string(),
+            },
+            OrderStatus::Resting {
+                oid: 102,
+                cloid: None,
+            },
+        ],
+        error: None,
+    };
+    let filled_entry = SubmitReceipt {
+        id: 1,
+        status: ExecutionStatus::Accepted,
+        statuses: vec![OrderStatus::Filled {
+            oid: 201,
+            total_size: "0.01".to_string(),
+            average_price: "50000".to_string(),
+        }],
+        error: None,
+    };
+    let rejected_stop = SubmitReceipt {
+        id: 2,
+        status: ExecutionStatus::Rejected,
+        statuses: vec![OrderStatus::Error {
+            message: "rejected by exchange".to_string(),
+        }],
+        error: None,
+    };
+    let scale_entry_trail = scale_entry.clone();
+    let rejected_trailing = SubmitReceipt {
+        id: 2,
+        status: ExecutionStatus::Rejected,
+        statuses: vec![OrderStatus::Error {
+            message: "native trailing rejected".to_string(),
+        }],
+        error: None,
+    };
+    // (case, command, script, expected final status, expected attempted actions)
+    let cases = [
+        (
+            "A: ambiguous protected entry after a 15 s post timeout",
+            "buy 0.01 at 50000 trail 1%",
+            vec![(
+                ScriptedEffect::StalePosition,
+                ambiguous(41, "action websocket post 1 timed out after 15000ms"),
+            )],
+            ExecutionStatus::Ambiguous,
+            vec!["order"],
+        ),
+        (
+            "B: ambiguous fixed stop-loss on a partially filled protected scale",
+            "scale buy 0.02 into 2 from 50000 to 49500 sl 48000",
+            vec![
+                (ScriptedEffect::ApplyReceipt, scale_entry.clone()),
+                (ScriptedEffect::None, ambiguous(2, "sl post timed out")),
+            ],
+            ExecutionStatus::Ambiguous,
+            vec!["order", "order"],
+        ),
+        (
+            "C: accepted entry keeps its receipt when protection reconciliation fails",
+            "buy 0.01 at 50000 sl 48000",
+            vec![(ScriptedEffect::StalePosition, filled_entry)],
+            ExecutionStatus::Accepted,
+            vec!["order"],
+        ),
+        (
+            "D: ambiguous remaining-entry cancel after a rejected stop-loss",
+            "scale buy 0.02 into 2 from 50000 to 49500 sl 48000",
+            vec![
+                (ScriptedEffect::ApplyReceipt, scale_entry),
+                (ScriptedEffect::None, rejected_stop),
+                (ScriptedEffect::None, ambiguous(3, "cancel post timed out")),
+            ],
+            ExecutionStatus::Ambiguous,
+            vec!["order", "order", "cancel"],
+        ),
+        (
+            "E: ambiguous remaining-entry cancel after a rejected native trailing stop",
+            "scale buy 0.02 into 2 from 50000 to 49500 trail 1%",
+            vec![
+                (ScriptedEffect::ApplyReceipt, scale_entry_trail),
+                (ScriptedEffect::None, rejected_trailing),
+                (ScriptedEffect::None, ambiguous(3, "cancel post timed out")),
+            ],
+            ExecutionStatus::Ambiguous,
+            vec!["order", "trailing", "cancel"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, input, script, expected_status, expected_actions) in cases {
+        let state = Arc::new(RwLock::new(ready_perp("0")));
+        let inner = Arc::new(ScriptedPlanExecutor::new(state.clone(), script));
+        let managed = ManagedExecutor::spawn(state, inner.clone(), Duration::from_secs(60));
+        let result = managed.execute_command(command::parse(input)).await;
+        // Read before yielding so the background poll cannot add actions to this command's trace.
+        let actions = inner.action_kinds();
+        match result {
+            Ok(receipt) if receipt.status == expected_status && receipt.error.is_some() => {}
+            Ok(receipt) => failures.push(format!(
+                "{case}: expected {expected_status:?} with a visible error, got {receipt:?}"
+            )),
+            Err(err) => failures.push(format!("{case}: receipt lost to Err({err})")),
+        }
+        if actions != expected_actions {
+            failures.push(format!(
+                "{case}: expected actions {expected_actions:?}, attempted {actions:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[tokio::test]

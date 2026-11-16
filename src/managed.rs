@@ -1,4 +1,4 @@
-// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): propagated marketCrossBps to all managed Planner sites and preserved reconciled terminal oid.
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): propagated marketCrossBps to all managed Planner sites, preserved reconciled terminal oid, and kept ambiguous or accepted entry receipts without follow-up actions after ambiguity.
 use std::{
     fs,
     io::Write,
@@ -640,12 +640,23 @@ impl ManagedExecutor {
             return Ok(receipt);
         }
         self.sync_pending_protection(&protection).await?;
+        // Ambiguous delivery halts execution: report the unknown outcome and send nothing further.
+        if receipt.status == ExecutionStatus::Ambiguous {
+            return Ok(receipt);
+        }
         match self.reconcile_entry_protection(&mut protection).await {
             Ok(Some(armed)) => Ok(merge_receipts(receipt, armed)),
             Ok(None) => Ok(receipt),
-            Err(err) => Err(format!(
-                "entry accepted but protection reconciliation failed: {err}"
-            )),
+            Err(err) => {
+                // The entry already reached the exchange; keep its receipt so the caller sees it.
+                let mut receipt = receipt;
+                let failure = format!("entry accepted but protection reconciliation failed: {err}");
+                receipt.error = Some(match receipt.error.take() {
+                    Some(previous) => format!("{previous}; {failure}"),
+                    None => failure,
+                });
+                Ok(receipt)
+            }
         }
     }
 
@@ -926,14 +937,18 @@ impl ManagedExecutor {
                     Ok(receipt) => {
                         protection.next_attempt_ms = u64::MAX;
                         self.sync_pending_protection(protection).await?;
+                        let mut outcome = receipt.clone();
                         if receipt.status != ExecutionStatus::Ambiguous
                             && let Some(cancel) =
                                 self.cancel_remaining_entry_orders(protection).await?
                         {
-                            statuses.extend(cancel.statuses);
+                            statuses.extend(cancel.statuses.clone());
+                            if cancel.status == ExecutionStatus::Ambiguous {
+                                outcome = cancel;
+                            }
                         }
-                        statuses.extend(receipt.statuses.clone());
-                        return Ok(Some(self.aggregate_protection_receipt(&receipt, statuses)));
+                        statuses.extend(receipt.statuses);
+                        return Ok(Some(self.aggregate_protection_receipt(&outcome, statuses)));
                     }
                     Err(err) => {
                         protection.next_attempt_ms = u64::MAX;
@@ -976,10 +991,17 @@ impl ManagedExecutor {
             if !accepted(&receipt) {
                 protection.next_attempt_ms = u64::MAX;
                 self.sync_pending_protection(protection).await?;
-                if let Some(cancel) = self.cancel_remaining_entry_orders(protection).await? {
-                    statuses.extend(cancel.statuses);
+                let mut outcome = receipt;
+                // Ambiguous delivery halts execution, so only a definite failure cancels the rest.
+                if outcome.status != ExecutionStatus::Ambiguous
+                    && let Some(cancel) = self.cancel_remaining_entry_orders(protection).await?
+                {
+                    statuses.extend(cancel.statuses.clone());
+                    if cancel.status == ExecutionStatus::Ambiguous {
+                        outcome = cancel;
+                    }
                 }
-                return Ok(Some(self.aggregate_protection_receipt(&receipt, statuses)));
+                return Ok(Some(self.aggregate_protection_receipt(&outcome, statuses)));
             }
             protection.leg_mut(&kind).expect("leg exists").size = target_size;
             self.sync_pending_protection(protection).await?;
