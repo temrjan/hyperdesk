@@ -39,7 +39,16 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        // R-04: under `--json`, an argument-parse failure is a pre-enqueue error and must still
+        // produce the single-object JSON envelope. Help output and non-JSON calls keep clap behaviour.
+        Err(err) if err.use_stderr() && json_flag_requested() => {
+            let code = emit_pre_submit_error(err.render().to_string().trim());
+            std::process::exit(code);
+        }
+        Err(err) => err.exit(),
+    };
     if args.json {
         let code = run_json(args).await;
         std::process::exit(code);
@@ -86,6 +95,15 @@ async fn close_market_session(path: &Path, session_id: u64) -> anyhow::Result<()
         IpcResponse::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected market session close response: {other:?}"),
     }
+}
+
+/// Detects `--json` among the raw client arguments when clap parsing failed. Arguments after a
+/// literal `--` belong to the command and are ignored.
+fn json_flag_requested() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .take_while(|arg| arg != "--")
+        .any(|arg| arg == "--json")
 }
 
 fn emit_json(value: &Value) {

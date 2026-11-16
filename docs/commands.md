@@ -33,7 +33,9 @@ balances.
 
 Pass `--json` (with optional `--wait-ms <u64>`, default `30000`, env `HL_V2_WAIT_MS`) for scripts
 and AI agents. Every `hl --json <command...>` call writes **exactly one** `\n`-terminated JSON
-object to `stdout` (zero ANSI escape codes or plain-text prefixes) and exits with a strict code:
+object to `stdout` (zero ANSI escape codes or plain-text prefixes) and exits with a strict code.
+Invalid client arguments under `--json` (for example a non-numeric `--wait-ms` or an unknown flag)
+are pre-enqueue errors: `exit 1`, `"submitted": false`, `"retrySafe": true`.
 
 | Exit code | Meaning | Agent / automation rule |
 | --- | --- | --- |

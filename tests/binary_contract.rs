@@ -560,6 +560,49 @@ async fn r04_hl_json_contract_and_e2e_agent_scenario() {
         assert_eq!(missing_json["retrySafe"], true);
         assert!(missing_json["commandId"].is_null());
 
+        // R-04 regression: client argument-parse failures under `--json` (invalid `--wait-ms`, unknown
+        // flag, invalid `HL_V2_WAIT_MS`) emit the pre-enqueue error envelope and exit `1`, never an
+        // empty stdout with the ambiguous exit code `2`.
+        let invalid_wait = run_hl(
+            &dir,
+            &missing_socket,
+            &["--json", "--wait-ms", "abc", "status"],
+        );
+        let unknown_flag = run_hl(&dir, &missing_socket, &["--json", "--bogus-flag", "status"]);
+        let invalid_wait_env = ProcessCommand::new(env!("CARGO_BIN_EXE_hl"))
+            .env("HL_V2_WAIT_MS", "abc")
+            .arg("--data-dir")
+            .arg(&dir)
+            .arg("--ipc-path")
+            .arg(&missing_socket)
+            .args(["--json", "status"])
+            .output()
+            .unwrap();
+        for (case, output) in [
+            ("invalid --wait-ms", &invalid_wait),
+            ("unknown flag", &unknown_flag),
+            ("invalid HL_V2_WAIT_MS", &invalid_wait_env),
+        ] {
+            assert_eq!(output.status.code(), Some(1), "{case}");
+            let parsed = parse_single_json_stdout(output);
+            assert_eq!(parsed["ok"], false, "{case}");
+            assert_eq!(parsed["type"], "error", "{case}");
+            assert_eq!(parsed["submitted"], false, "{case}");
+            assert_eq!(parsed["outcomeUnknown"], false, "{case}");
+            assert_eq!(parsed["retrySafe"], true, "{case}");
+            assert!(parsed["commandId"].is_null(), "{case}");
+            assert!(
+                parsed["error"].as_str().is_some_and(|e| !e.is_empty()),
+                "{case}"
+            );
+        }
+
+        // Without `--json`, argument-parse failures keep the standard clap usage error behaviour.
+        let plain_invalid_wait = run_hl(&dir, &missing_socket, &["--wait-ms", "abc", "status"]);
+        assert_eq!(plain_invalid_wait.status.code(), Some(2));
+        assert!(plain_invalid_wait.stdout.is_empty());
+        assert!(!plain_invalid_wait.stderr.is_empty());
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 
