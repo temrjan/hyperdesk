@@ -1,4 +1,4 @@
-// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): added live untracked HIP-3 exposure detection when includeHip3=false.
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): added live untracked HIP-3 exposure detection when includeHip3=false, ignoring pre-session fills.
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
@@ -520,17 +520,20 @@ async fn apply_user_fills(state: &Arc<RwLock<TradingState>>, data: &Value) -> an
             .get("coin")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("fill missing coin"))?;
+        let time_ms = fill
+            .get("time")
+            .and_then(value_u64)
+            .ok_or_else(|| anyhow::anyhow!("fill missing time"))?;
+        // Same session cutoff as `TradingState::record_fill`: replayed pre-session history is
+        // not live HIP-3 activity.
         if !snapshot.include_hip3
+            && time_ms >= snapshot.fill_session_start_ms
             && let Some((dex, _)) = raw_coin.split_once(':')
             && !dex.trim().is_empty()
         {
             untracked_dexes.insert(dex.trim().to_string());
         }
         let symbol = canonical_symbol_for_coin(&snapshot, raw_coin);
-        let time_ms = fill
-            .get("time")
-            .and_then(value_u64)
-            .ok_or_else(|| anyhow::anyhow!("fill missing time"))?;
         let is_buy = match fill.get("side").and_then(Value::as_str) {
             Some("B") => true,
             Some("A") => false,

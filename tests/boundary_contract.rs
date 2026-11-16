@@ -1,4 +1,4 @@
-// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed HTTP server test and added R-01, R-03, R-07, R-09, and R-10 boundary checks.
+// Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): removed HTTP server test and added R-01, R-03, R-07, R-09, R-10, and CR-02 boundary checks.
 mod support;
 
 use std::{collections::BTreeMap, fs, path::PathBuf};
@@ -787,6 +787,8 @@ async fn r03_include_hip3_defaults_true_and_no_hip3_guards_startup_and_live_expo
         // Verify live `userFills` for `dex:COIN` also triggers the persistent health guard on a clean `--no-hip3` state.
         let mut base2 = support::ready_perp("0");
         base2.include_hip3 = false;
+        // `seed_state` starts the fill session after the startup exposure guard passes.
+        base2.fill_session_start_ms = now_ms();
         let state2 = Arc::new(RwLock::new(base2));
         let metrics2 = Metrics::default();
         metrics2.state_ws_connected();
@@ -799,6 +801,37 @@ async fn r03_include_hip3_defaults_true_and_no_hip3_guards_startup_and_live_expo
             metrics2,
             CommandQueue::new(service2).unwrap(),
         );
+        // CR-02: the initial `userFills` snapshot replays pre-session history, which is not live
+        // HIP-3 activity and must not trip the untracked HIP-3 guard.
+        let session_start = state2.read().await.fill_session_start_ms;
+        let historical_snapshot_msg = json!({
+            "channel": "userFills",
+            "data": {
+                "user": user,
+                "isSnapshot": true,
+                "fills": [{
+                    "coin": "xyz:NVDA",
+                    "px": "120.0",
+                    "sz": "1.0",
+                    "side": "B",
+                    "time": session_start.saturating_sub(60_000),
+                    "closedPnl": "0.0",
+                    "oid": 50_u64,
+                    "tid": 60_u64
+                }]
+            }
+        })
+        .to_string();
+        apply_ws_message_for(&state2, &historical_snapshot_msg, Some(&user), &watched)
+            .await
+            .expect("apply historical userFills snapshot");
+        match app2.dispatch(IpcRequest::Health).await {
+            IpcResponse::Health(health) => assert!(
+                health.ok && health.reasons.is_empty(),
+                "pre-session historical HIP-3 fill in WS snapshot must not trip live untracked_hip3_warning: {health:?}"
+            ),
+            other => panic!("unexpected health response: {other:?}"),
+        }
         let live_fill_msg = json!({
             "channel": "userFills",
             "data": {
