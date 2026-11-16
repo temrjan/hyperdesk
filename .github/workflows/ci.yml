@@ -1,3 +1,4 @@
+# Modified in hyperdesk from upstream bahmgit/hlcli (Apache-2.0): added --workspace, the validation security gate steps, and a security-audit job.
 name: CI
 
 on:
@@ -28,12 +29,37 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check all targets
-        run: cargo check --locked --all-targets
+        run: cargo check --workspace --locked --all-targets
       - name: Lint all targets
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - name: Test all targets
-        run: cargo test --locked --all-targets
+        run: cargo test --workspace --locked --all-targets
       - name: Build release binaries
         run: cargo build --locked --release --bins
+      - name: Check HTTP server dependency is absent
+        run: test -z "$(cargo tree --locked --all-targets -i axum 2>/dev/null)"
+      - name: Check server and stty code is absent
+        run: '! grep -rnE ''\bmod server\b|server::|Command::new\("stty"\)'' src/'
+      - name: Check rkyv is uncompiled
+        run: test -z "$(cargo tree --locked -e features --target all -i rkyv 2>/dev/null)"
       - name: Check diff integrity
         run: git diff --check
+
+  security-audit:
+    name: Security audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+      - name: Audit dependencies against a freshly fetched advisory database
+        run: >-
+          cargo audit -D unsound
+          --ignore RUSTSEC-2026-0235
+          --ignore RUSTSEC-2026-0387

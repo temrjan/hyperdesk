@@ -20,6 +20,11 @@ cargo audit --no-fetch -D unsound \
 git diff --check
 ```
 
+GitHub Actions (`.github/workflows/ci.yml`) runs this gate on pushes to `main` and on pull requests. Its
+`security-audit` job runs `cargo audit -D unsound` with the same `--ignore` list against a freshly
+fetched advisory database (no `--no-fetch`), so it can report advisories that a stale local database
+misses; keep the two ignore lists in sync.
+
 Tests require no exchange account, live network, or secrets. They exercise compilation under
 `#![forbid(unsafe_code)]`, mocked exchange HTTP/WebSocket boundaries, journal-before-post and
 `/info` `orderStatus` + `userFills` VWAP reconciliation, `marketCrossBps` propagation, `--no-hip3`
