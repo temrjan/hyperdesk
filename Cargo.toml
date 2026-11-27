@@ -7,7 +7,7 @@ rust-version = "1.91"
 description = "Daemon-first command-line trading client for Hyperliquid"
 license = "Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/bahmgit/hlcli"
+repository = "https://github.com/temrjan/hyperdesk"
 publish = false
 
 [lib]
